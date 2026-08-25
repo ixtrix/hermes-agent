@@ -351,6 +351,10 @@ export function stageNodePty({ platform = process.platform, arch = process.arch 
 
 // Allow direct CLI invocation: node scripts/stage-native-deps.mjs [platform] [arch]
 if (isMain(import.meta.url)) {
-  const [platform, arch] = process.argv.slice(2)
-  stageNodePty({ platform, arch })
+  if (process.env.HERMES_DESKTOP_BUILD_PRODUCT === 'internal' || process.env.HERMES_DESKTOP_BUILD_PRODUCT === 'external') {
+    console.log('[stage-native-deps] managed product: native dependency staging disabled')
+  } else {
+    const [platform, arch] = process.argv.slice(2)
+    stageNodePty({ platform, arch })
+  }
 }

@@ -105,6 +105,25 @@ test('buildNativeAuthorizeUrl encodes params and honours a path prefix', () => {
   assert.equal(parsed.searchParams.get('state'), 'STATE')
   assert.equal(parsed.searchParams.get('provider'), 'nous')
 })
+test('buildNativeAuthorizeUrl carries fixed managed OIDC assertions', () => {
+  const parsed = new URL(
+    buildNativeAuthorizeUrl('https://gw.example.com', {
+      challenge: 'C',
+      redirectUri: 'http://127.0.0.1:1/cb',
+      state: 'S',
+      oidc: {
+        issuer: 'https://login.example.test',
+        audience: 'hermes-desktop',
+        redirectUri: 'https://hermes.example.test/oidc/callback'
+      }
+    })
+  )
+
+  assert.equal(parsed.searchParams.get('oidc_issuer'), 'https://login.example.test')
+  assert.equal(parsed.searchParams.get('oidc_audience'), 'hermes-desktop')
+  assert.equal(parsed.searchParams.get('oidc_redirect_uri'), 'https://hermes.example.test/oidc/callback')
+})
+
 
 test('buildNativeAuthorizeUrl omits provider when not given and preserves prefix', () => {
   const url = buildNativeAuthorizeUrl('https://gw.example.com/hermes', {

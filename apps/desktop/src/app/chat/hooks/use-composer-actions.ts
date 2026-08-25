@@ -3,9 +3,11 @@ import { useCallback } from 'react'
 import { requestComposerFocus, requestComposerInsert, requestComposerInsertRefs } from '@/app/chat/composer/focus'
 import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
+import type { ManagedAttachmentPurpose, ManagedPickedAttachment, ManagedSupplierMetadata } from '@/global'
 import { useI18n } from '@/i18n'
 import { attachmentId, contextPath, pathLabel } from '@/lib/chat-runtime'
 import { readDesktopFileDataUrl, selectDesktopPaths } from '@/lib/desktop-fs'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { normalize } from '@/lib/text'
 import {
   addComposerAttachment,
@@ -34,6 +36,42 @@ function blobExtension(blob: Blob): string {
   const mime = normalize(blob.type.split(';')[0])
 
   return BLOB_MIME_EXTENSION[mime] || '.png'
+}
+
+function bytesToDataUrl(bytes: Uint8Array, mime: string): string {
+  let binary = ''
+
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  }
+
+  return `data:${mime || 'application/octet-stream'};base64,${btoa(binary)}`
+}
+
+function managedPicker() {
+  return isManagedProductBuild ? window.hermesDesktop?.pickAttachmentBytes : undefined
+}
+
+function attachmentFromBytes(kind: 'file' | 'image', picked: ManagedPickedAttachment): ComposerAttachment {
+  const bytes = picked.bytes instanceof Uint8Array ? picked.bytes : new Uint8Array(picked.bytes)
+  const mime = normalize(picked.mime || 'application/octet-stream')
+  const label = picked.name || (kind === 'image' ? 'image' : 'attachment')
+
+  if ((kind === 'image' && picked.purpose !== 'media') || (kind === 'file' && picked.purpose === 'media')) {
+    throw new Error('Managed attachment purpose does not match its content.')
+  }
+
+  return {
+    id: attachmentId(kind, `${label}:${picked.size}`),
+    kind,
+    label,
+    bytes,
+    mime,
+    purpose: picked.purpose,
+    size: picked.size,
+    ...(picked.supplier ? { supplierMetadata: picked.supplier } : {}),
+    ...(kind === 'image' ? { previewUrl: bytesToDataUrl(bytes, mime) } : {})
+  }
 }
 
 export function isImagePath(filePath: string): boolean {
@@ -320,6 +358,10 @@ export function useComposerActions({
           ? 'url'
           : 'file'
 
+      if (isManagedProductBuild && (kind === 'file' || kind === 'folder')) {
+        return
+      }
+
       attachToMain({
         id: attachmentId(kind, refText),
         kind,
@@ -330,9 +372,32 @@ export function useComposerActions({
     },
     [attachToMain]
   )
-
   const pickContextPaths = useCallback(
-    async (kind: 'file' | 'folder') => {
+    async (
+      kind: 'file' | 'folder',
+      managedOptions?: { purpose?: ManagedAttachmentPurpose; supplier?: ManagedSupplierMetadata }
+    ) => {
+      if (isManagedProductBuild) {
+        const picker = managedPicker()
+
+        if (kind === 'folder' || !picker) {
+          return
+        }
+
+        const picked = await picker({
+          multiple: true,
+          purpose: managedOptions?.purpose || 'document',
+          ...(managedOptions?.supplier ? { supplier: managedOptions.supplier } : {}),
+          title: 'Add files as context'
+        })
+
+        for (const item of picked || []) {
+          attachToMain(attachmentFromBytes('file', item))
+        }
+
+        return
+      }
+
       const paths = await selectDesktopPaths({
         title: kind === 'file' ? 'Add files as context' : 'Add folders as context',
         defaultPath: currentCwd || undefined,
@@ -361,7 +426,7 @@ export function useComposerActions({
 
   const insertContextPathInlineRef = useCallback(
     (path: string, isDirectory = false) => {
-      if (!path) {
+      if (isManagedProductBuild || !path) {
         return false
       }
 
@@ -381,7 +446,7 @@ export function useComposerActions({
 
   const attachContextFilePath = useCallback(
     (filePath: string) => {
-      if (!filePath) {
+      if (isManagedProductBuild || !filePath) {
         return false
       }
 
@@ -403,7 +468,7 @@ export function useComposerActions({
 
   const attachImagePath = useCallback(
     async (filePath: string) => {
-      if (!filePath) {
+      if (isManagedProductBuild || !filePath) {
         return false
       }
 
@@ -443,10 +508,25 @@ export function useComposerActions({
       if (blob.type && !blob.type.startsWith('image/')) {
         return false
       }
-
       try {
-        const buffer = await blob.arrayBuffer()
-        const data = new Uint8Array(buffer)
+        const data = new Uint8Array(await blob.arrayBuffer())
+
+        if (isManagedProductBuild) {
+          const fileName = typeof File !== 'undefined' && blob instanceof File && blob.name ? blob.name : `image${blobExtension(blob)}`
+
+          attachToMain(
+            attachmentFromBytes('image', {
+              name: fileName,
+              mime: blob.type || 'image/png',
+              purpose: 'media',
+              size: data.byteLength,
+              bytes: data
+            })
+          )
+
+          return true
+        }
+
         const savedPath = await window.hermesDesktop?.saveImageBuffer(data, blobExtension(blob))
 
         if (!savedPath) {
@@ -466,6 +546,34 @@ export function useComposerActions({
   )
 
   const pickImages = useCallback(async () => {
+    if (isManagedProductBuild) {
+      const picker = managedPicker()
+
+      if (!picker) {
+        return
+      }
+
+      const picked = await picker({
+        filters: [
+          {
+            name: t.composer.images,
+            extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'svg']
+          }
+        ],
+        multiple: true,
+        purpose: 'media',
+        title: copy.attachImages
+      })
+
+      for (const item of picked || []) {
+        if (item.mime.startsWith('image/') || isImagePath(item.name)) {
+          attachToMain(attachmentFromBytes('image', item))
+        }
+      }
+
+      return
+    }
+
     const paths = await selectDesktopPaths({
       title: copy.attachImages,
       defaultPath: currentCwd || undefined,
@@ -484,13 +592,16 @@ export function useComposerActions({
     for (const path of paths) {
       await attachImagePath(path)
     }
-  }, [attachImagePath, copy.attachImages, currentCwd, t.composer.images])
+  }, [attachImagePath, attachToMain, copy.attachImages, currentCwd, t.composer.images])
 
   const pasteClipboardImage = useCallback(
     async ({ silent = false }: { silent?: boolean } = {}) => {
+      if (isManagedProductBuild) {
+        return false
+      }
+
       try {
         const path = await window.hermesDesktop?.saveClipboardImage()
-
         if (!path) {
           if (!silent) {
             notify({
@@ -519,7 +630,7 @@ export function useComposerActions({
 
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {
-      if (!folderPath) {
+      if (isManagedProductBuild || !folderPath) {
         return false
       }
 
@@ -543,6 +654,32 @@ export function useComposerActions({
     async (candidates: DroppedFile[]) => {
       if (candidates.length === 0) {
         return false
+      }
+
+      if (isManagedProductBuild) {
+        let attached = false
+
+        for (const candidate of candidates) {
+          if (!candidate.file || candidate.isDirectory) {
+            continue
+          }
+
+          const bytes = new Uint8Array(await candidate.file.arrayBuffer())
+          const image = candidate.file.type.startsWith('image/') || isImagePath(candidate.file.name)
+
+          attachToMain(
+            attachmentFromBytes(image ? 'image' : 'file', {
+              name: candidate.file.name || (image ? 'image' : 'attachment'),
+              mime: candidate.file.type || (image ? 'image/png' : 'application/octet-stream'),
+              purpose: image ? 'media' : 'document',
+              size: bytes.byteLength,
+              bytes
+            })
+          )
+          attached = true
+        }
+
+        return attached
       }
 
       let attached = false
@@ -629,8 +766,8 @@ export function useComposerActions({
       const removed = scope.remove(id)
 
       if (
+        !isManagedProductBuild &&
         removed?.kind === 'image' &&
-        removed.path &&
         activeSessionId &&
         removed.attachedSessionId &&
         removed.attachedSessionId === activeSessionId

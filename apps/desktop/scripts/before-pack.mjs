@@ -130,6 +130,12 @@ export default async function beforePack(context) {
     console.warn(`[before-pack] could not clean ${appOutDir} (${err.message}); continuing`)
   }
 
+  if (process.env.HERMES_DESKTOP_BUILD_PRODUCT === 'internal' || process.env.HERMES_DESKTOP_BUILD_PRODUCT === 'external') {
+    console.log('[before-pack] managed product: native dependency staging disabled')
+
+    return
+  }
+
   try {
     const platform = context && context.electronPlatformName
     const archName = context && typeof context.arch === 'number' ? Arch[context.arch] : undefined
@@ -137,8 +143,7 @@ export default async function beforePack(context) {
       if (archName === 'universal') {
         console.warn(
           '[before-pack] target arch is "universal" — node-pty has no universal prebuild; ' +
-            'staged binary will be whichever single-arch copy npm run build left behind. ' +
-            'lipo-merge x64/arm64 .node files manually if you need a true universal build.'
+            'ordinary build will use the single-arch copy left by npm run build.'
         )
       } else {
         await stageNodePty({ platform, arch: archName })
@@ -146,9 +151,6 @@ export default async function beforePack(context) {
       }
     }
   } catch (err) {
-    // This one SHOULD fail the build — a missing/wrong native binary for the
-    // target arch means a broken package shipped to users, which is worse
-    // than a build that fails loudly here.
     throw new Error(`[before-pack] failed to stage node-pty for this target: ${err.message}`)
   }
 }

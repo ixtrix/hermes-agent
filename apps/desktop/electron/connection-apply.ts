@@ -1,6 +1,7 @@
 async function applyConnectionChange({
   cancelAndWait,
   isPrimary,
+  managed = false,
   rehomePrimary = null,
   scope,
   sendApplied,
@@ -8,6 +9,8 @@ async function applyConnectionChange({
   teardownPrimary,
   teardownSsh
 }) {
+  assertManagedConnectionMutable(managed)
+
   await cancelAndWait(scope)
   await teardownSsh(scope)
 
@@ -25,6 +28,12 @@ async function applyConnectionChange({
 
   await teardownPrimary()
   sendApplied()
+}
+
+function assertManagedConnectionMutable(managed) {
+  if (managed) {
+    throw new Error('Managed product connection is immutable.')
+  }
 }
 
 function commitConnectionFailure(current, starting, commit) {
@@ -54,4 +63,4 @@ async function resolveTerminalConnection(getTarget, ensureBackend) {
   return target
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection }
+export { applyConnectionChange, assertManagedConnectionMutable, commitConnectionFailure, resolveTerminalConnection }

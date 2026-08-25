@@ -27,11 +27,13 @@
  * trust seam.
  */
 
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 
 import { createPluginContext, type HermesPlugin } from './plugin'
 import { dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
+const MANAGED_PRODUCT_BUILD = isManagedProductBuild
 
 interface LoadOptions {
   /** Absolute plugin.js path (disk plugins) — recorded for reveal/inventory. */
@@ -92,18 +94,26 @@ async function verifyIntegrity(source: string, integrity: string): Promise<boole
 
   return actual === expected
 }
-
 export function unloadRuntimePlugin(id: string): void {
+  if (MANAGED_PRODUCT_BUILD) {
+    return
+  }
+
   loaded.get(id)?.forEach(dispose => dispose())
   loaded.delete(id)
-}
 
+
+}
 /** Evaluate + register one runtime plugin. Returns its id, or null on failure. */
 export async function loadRuntimePlugin(
   source: string,
   origin: string,
   options: LoadOptions = {}
 ): Promise<null | string> {
+  if (MANAGED_PRODUCT_BUILD) {
+    return null
+  }
+
   installPluginSdk()
 
   try {
@@ -235,8 +245,11 @@ async function loadDiskPlugin(name: string, file: string): Promise<void> {
 }
 
 async function scanDiskPlugins(): Promise<void> {
-  const desktop = window.hermesDesktop
+  if (MANAGED_PRODUCT_BUILD) {
+    return
+  }
 
+  const desktop = window.hermesDesktop
   // Re-entrancy guard: the 5s poll must not overlap a slow in-flight scan
   // (reads/loads can exceed the interval).
   if (!desktop || scanning) {
@@ -317,6 +330,10 @@ export const discoverRuntimePlugins = scanDiskPlugins
 /** Start the self-maintaining disk door: initial scan, per-file hot reload,
  *  fs-watched folder reconciliation (poll fallback on older shells). Idempotent. */
 export function watchRuntimePlugins(): void {
+  if (MANAGED_PRODUCT_BUILD) {
+    return
+  }
+
   const desktop = window.hermesDesktop
 
   if (watching || !desktop) {

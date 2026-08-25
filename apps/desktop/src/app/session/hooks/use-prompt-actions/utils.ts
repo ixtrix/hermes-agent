@@ -136,6 +136,24 @@ export function base64FromDataUrl(dataUrl: string): string {
 
   return comma >= 0 ? dataUrl.slice(comma + 1) : ''
 }
+export function base64FromBytes(bytes: Uint8Array): string {
+  let binary = ''
+
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  }
+
+  return btoa(binary)
+}
+
+export interface RemoteImageAttachPayload {
+  contentBase64: string
+  filename: string
+}
+
+export function dataUrlFromBytes(bytes: Uint8Array, mime: string): string {
+  return `data:${mime || 'application/octet-stream'};base64,${base64FromBytes(bytes)}`
+}
 
 export function imageFilenameFromPath(filePath: string): string {
   return filePath.split(/[\\/]/).filter(Boolean).pop() || 'image.png'
@@ -144,9 +162,7 @@ export function imageFilenameFromPath(filePath: string): string {
 // Remote gateway: the local composer-image file lives on THIS machine's disk,
 // not the gateway's, so read the bytes here and upload them via
 // image.attach_bytes. Returns null when the file can't be read.
-export async function readImageForRemoteAttach(
-  filePath: string
-): Promise<{ contentBase64: string; filename: string } | null> {
+export async function readImageForRemoteAttach(filePath: string): Promise<RemoteImageAttachPayload | null> {
   const dataUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 

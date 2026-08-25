@@ -78,7 +78,7 @@ export interface NativeLoginDeps {
 export async function runNativeLogin(
   baseUrl: string,
   deps: NativeLoginDeps,
-  opts: { provider?: string } = {}
+  opts: { oidc?: { audience: string; issuer: string; redirectUri: string }; provider?: string } = {}
 ): Promise<NativeTokenSet> {
   const createServer = deps.createServer || http.createServer
   const timeoutMs = deps.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS
@@ -185,6 +185,7 @@ export async function runNativeLogin(
         challenge,
         redirectUri,
         state,
+        oidc: opts.oidc,
         provider: opts.provider
       })
 

@@ -9,12 +9,14 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
   type ComposerAttachment,
+  type ManagedAttachmentReceipt,
   setComposerAttachmentUploadState,
   updateComposerAttachment
 } from '@/store/composer'
@@ -61,7 +63,9 @@ import {
 import { useSlashCommand } from './slash'
 import { useSubmitPrompt } from './submit'
 import {
+  base64FromBytes,
   blobToDataUrl,
+  dataUrlFromBytes,
   delay,
   friendlyRemoteAttachError,
   type GatewayRequest,
@@ -69,6 +73,7 @@ import {
   isSessionNotFoundError,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  type RemoteImageAttachPayload,
   type SubmitTextOptions
 } from './utils'
 
@@ -103,13 +108,117 @@ export async function uploadComposerAttachment(
   const { backendCwd, remote, requestGateway, sessionId } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
+
   const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd)
+  if (isManagedProductBuild) {
+    const bytes = attachment.bytes
+
+    if (!bytes || attachment.path || attachment.refText) {
+      throw new Error(`Managed attachments must contain picker bytes only: ${label}`)
+    }
+
+    const purpose = attachment.purpose
+    const supplier = attachment.supplierMetadata
+
+    if (
+      !purpose ||
+      (attachment.kind === 'image' && purpose !== 'media') ||
+      (attachment.kind === 'file' && purpose === 'media') ||
+      (purpose === 'supplier' &&
+        (!supplier?.supplier_id.trim() || !supplier?.supplier_domain.trim())) ||
+      (purpose !== 'supplier' && supplier)
+    ) {
+      throw new Error(`Managed attachment purpose is invalid for ${label}`)
+    }
+
+    const mime = attachment.mime || (attachment.kind === 'image' ? 'image/png' : 'application/octet-stream')
+    const size = bytes.byteLength
+    const rawResult = await requestGateway<{
+      attached?: boolean
+      attachment_id?: unknown
+      declared_mime?: string
+      detected_mime?: string
+      message?: string
+      metadata?: Record<string, string | number>
+      mime?: string
+      mime_type?: string
+      name?: string
+      purpose?: unknown
+      size?: number
+      size_bytes?: number
+      supplier?: { supplier_domain?: unknown; supplier_id?: unknown }
+      supplier_domain?: unknown
+      supplier_id?: unknown
+    }>(attachment.kind === 'image' ? 'image.attach_bytes' : 'file.attach', {
+      session_id: sessionId,
+      ...(attachment.kind === 'image'
+        ? {
+            content_base64: base64FromBytes(bytes),
+            filename: label,
+            mime,
+            mime_type: mime,
+            size
+          }
+        : {
+            data_url: dataUrlFromBytes(bytes, mime),
+            name: label,
+            mime,
+            mime_type: mime,
+            size
+          }),
+      purpose,
+      ...(supplier ? supplier : {})
+    })
+
+    const attachmentId = typeof rawResult.attachment_id === 'string' ? rawResult.attachment_id.trim() : ''
+    const responseSupplier =
+      rawResult.supplier && typeof rawResult.supplier === 'object' ? rawResult.supplier : undefined
+    const responseSupplierId =
+      rawResult.supplier_id ?? responseSupplier?.supplier_id ?? rawResult.metadata?.supplier_id
+    const responseSupplierDomain =
+      rawResult.supplier_domain ?? responseSupplier?.supplier_domain ?? rawResult.metadata?.supplier_domain
+    const responseHasSupplier =
+      responseSupplier !== undefined || responseSupplierId !== undefined || responseSupplierDomain !== undefined
+    const responsePurpose = rawResult.purpose ?? rawResult.metadata?.purpose
+
+    const responseSize = Number(rawResult.size ?? rawResult.size_bytes ?? size)
+    if (
+      rawResult.attached !== true ||
+      !attachmentId ||
+      responsePurpose !== purpose ||
+      !Number.isSafeInteger(responseSize) ||
+      responseSize !== size ||
+      (supplier
+        ? responseSupplierId !== supplier.supplier_id || responseSupplierDomain !== supplier.supplier_domain
+        : responseHasSupplier)
+    ) {
+      throw new Error(rawResult.message || `Could not attach ${label}`)
+    }
+
+    const receipt: ManagedAttachmentReceipt = {
+      attached: true,
+      attachment_id: attachmentId,
+      metadata: rawResult.metadata,
+      mime: rawResult.mime_type || rawResult.mime || rawResult.detected_mime || rawResult.declared_mime || mime,
+      name: rawResult.name || label,
+      purpose,
+      size: responseSize,
+      ...(supplier ? { supplier } : {})
+    }
+
+    return {
+      ...attachment,
+      attachedSessionId: sessionId,
+      receipt,
+      uploadState: undefined
+    }
+  }
 
   if (attachment.kind === 'image') {
     let result: ImageAttachResponse
 
     if (uploadBytes) {
-      let payload: Awaited<ReturnType<typeof readImageForRemoteAttach>>
+      let payload: RemoteImageAttachPayload | null
 
       try {
         payload = await readImageForRemoteAttach(path)
@@ -254,16 +363,15 @@ export function usePromptActions({
       }
 
       const messageId = `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const message: ChatMessage = {
+        id: messageId,
+        role,
+        parts: [textPart(body)]
+      }
 
       updateSessionState(
         sessionId,
         state => {
-          const message: ChatMessage = {
-            id: messageId,
-            role,
-            parts: [textPart(body)]
-          }
-
           const streamIndex =
             options.insertBeforeActiveReply && state.streamId
               ? state.messages.findIndex(candidate => candidate.id === state.streamId)
@@ -320,10 +428,16 @@ export function usePromptActions({
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
 
-        // Already-synced or pathless refs (terminal, url, etc.) pass through.
-        // A drop-time eager upload may already have staged this one (matching
-        // attachedSessionId) — don't re-upload it.
-        if (!attachment.path || attachment.attachedSessionId === sessionId) {
+        const managedAttachable =
+          isManagedProductBuild &&
+          (attachment.kind === 'image' || attachment.kind === 'file') &&
+          Boolean(attachment.bytes)
+        const alreadyAttached =
+          attachment.attachedSessionId === sessionId && (!isManagedProductBuild || Boolean(attachment.receipt))
+
+        // Managed attachments are intentionally pathless: their picker bytes
+        // are admitted once and carried by an opaque receipt.
+        if ((!attachment.path && !managedAttachable) || alreadyAttached) {
           synced.push(attachment)
 
           continue

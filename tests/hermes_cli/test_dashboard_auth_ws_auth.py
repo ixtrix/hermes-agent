@@ -20,13 +20,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
-from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth import (
+    clear_providers,
+    list_session_providers,
+    register_provider,
+)
 from hermes_cli.dashboard_auth.ws_tickets import (
     _reset_for_tests,
     consume_internal_credential,
     internal_ws_credential,
     mint_ticket,
 )
+from tui_gateway import server as gateway_server
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -190,6 +196,7 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
         query_params=_QP(query),
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
+        scope={},
     )
 
 
@@ -206,12 +213,59 @@ class TestWsAuthOkGated:
 
 
     def test_consumed_ticket_rejected(self, gated_app):
-        ticket = mint_ticket(user_id="u1", provider="stub")
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            session_expires_at=10**10,
+        )
         ws_one = _fake_ws(query={"ticket": ticket})
         ws_two = _fake_ws(query={"ticket": ticket})
         assert web_server._ws_auth_ok(ws_one) is True
         # Single-use — second consumption fails.
         assert web_server._ws_auth_ok(ws_two) is False
+
+    def test_revoked_session_rejected_before_ticket_consume(
+        self, gated_app, monkeypatch
+    ):
+        _logged_in(gated_app)
+        response = gated_app.post("/api/auth/ws-ticket")
+        assert response.status_code == 200
+        provider = list_session_providers()[0]
+        monkeypatch.setattr(provider, "verify_session", lambda **_: None)
+        assert web_server._ws_auth_ok(
+            _fake_ws(query={"ticket": response.json()["ticket"]})
+        ) is False
+
+    def test_consumed_principal_rejects_later_revocation(
+        self, gated_app, monkeypatch
+    ):
+        provider = list_session_providers()[0]
+        verified = Session(
+            user_id="u1",
+            email="u1@example.test",
+            display_name="User One",
+            org_id="org",
+            provider="stub",
+            expires_at=10**10,
+            access_token="opaque",
+            refresh_token="",
+            subject="oidc-sub",
+        )
+        monkeypatch.setattr(provider, "verify_session", lambda **_: verified)
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            subject="oidc-sub",
+            session_expires_at=10**10,
+            access_token="opaque",
+        )
+        ws = _fake_ws(query={"ticket": ticket})
+        assert web_server._ws_auth_ok(ws) is True
+        principal = web_server._ws_principal(ws)
+        assert principal is not None
+        assert gateway_server.ws_principal_is_active(principal) is True
+        monkeypatch.setattr(provider, "verify_session", lambda **_: None)
+        assert gateway_server.ws_principal_is_active(principal) is False
 
 
     def test_legacy_token_rejected_in_gated_mode(self, gated_app):

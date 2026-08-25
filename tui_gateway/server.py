@@ -11,6 +11,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -52,6 +53,75 @@ from tui_gateway.transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The HTTP gateway binds the verified browser ticket principal to this request
+# context before dispatch.  ContextVar propagation keeps the binding intact
+# when long handlers move to the worker pool.
+_WS_PRINCIPAL: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "hermes_ws_principal", default=None
+)
+
+
+def bind_ws_principal(principal: dict[str, Any] | None):
+    return _WS_PRINCIPAL.set(dict(principal) if principal is not None else None)
+
+
+def reset_ws_principal(token) -> None:
+    _WS_PRINCIPAL.reset(token)
+
+
+def current_ws_principal() -> dict[str, Any] | None:
+    principal = _WS_PRINCIPAL.get()
+    return dict(principal) if principal is not None else None
+
+def ws_principal_is_active(principal: dict[str, Any] | None) -> bool:
+    """Revalidate a managed WS principal through the session authority."""
+    if principal is None:
+        return True
+    session_expires_at = principal.get("session_expires_at")
+    if (
+        isinstance(session_expires_at, bool)
+        or not isinstance(session_expires_at, (int, float))
+        or session_expires_at <= time.time()
+        or principal.get("revoked") is True
+    ):
+        return False
+    access_token = principal.get("_session_access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return True
+
+    try:
+        from hermes_cli.dashboard_auth import list_session_providers
+        from hermes_cli.dashboard_auth.base import ProviderError
+    except Exception:
+        return False
+
+    provider_name = principal.get("provider")
+    for provider in list_session_providers():
+        if getattr(provider, "name", None) != provider_name:
+            continue
+        try:
+            session = provider.verify_session(access_token=access_token)
+        except ProviderError:
+            return False
+        if session is None:
+            return False
+        if (
+            session.provider != provider_name
+            or session.user_id != principal.get("user_id")
+            or getattr(session, "subject", "") != principal.get("subject")
+        ):
+            return False
+        session_id = principal.get("session_id")
+        if session_id and getattr(session, "session_id", "") != session_id:
+            return False
+        verified_expires_at = getattr(session, "expires_at", None)
+        return (
+            isinstance(verified_expires_at, (int, float))
+            and not isinstance(verified_expires_at, bool)
+            and verified_expires_at > time.time()
+        )
+    return False
 
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
@@ -1897,20 +1967,16 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
-def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
-    """Route inbound RPCs — long handlers to the pool, everything else inline.
-
-    Returns a response dict when handled inline. Returns None when the
-    handler was scheduled on the pool; the worker writes its own response
-    via the bound transport when done.
-
-    *transport* (optional): pins every write produced by this request —
-    including any events emitted by the handler — to the given transport.
-    Omitting it falls back to the module-level stdio transport, preserving
-    the original behaviour for ``tui_gateway.entry``.
-    """
+def dispatch(
+    req: dict,
+    transport: Optional[Transport] = None,
+    *,
+    principal: dict[str, str] | None = None,
+) -> dict | None:
+    """Route inbound RPCs, carrying a server-verified WS principal."""
     t = transport or _stdio_transport
-    token = bind_transport(t)
+    transport_token = bind_transport(t)
+    principal_token = bind_ws_principal(principal)
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
@@ -1935,7 +2001,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         return None
     finally:
-        reset_transport(token)
+        reset_ws_principal(principal_token)
+        reset_transport(transport_token)
 
 
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
@@ -4051,7 +4118,251 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
+_MANAGED_STAFF_PLANES = frozenset({"internal", "external"})
+_MANAGED_STAFF_TOOLSETS = {
+    "internal": frozenset(
+        {
+            "skills",
+            "clarify",
+            "mcp-memory_guard",
+            "mcp-document_guard",
+            "mcp-media_guard",
+            "mcp-staff_order",
+            "mcp-scope_ack",
+            "mcp-outlook",
+            "mcp-staff_runtime",
+        }
+    ),
+    "external": frozenset(
+        {
+            "web",
+            "vision",
+            "skills",
+            "clarify",
+            "mcp-media_guard",
+            "mcp-external_runtime",
+            "mcp-staff_runtime",
+        }
+    ),
+}
+_MANAGED_STAFF_ADMISSION_ADAPTER = None
+_MANAGED_STAFF_IDENTITY_ADAPTER = None
+
+
+def configure_managed_staff_adapters(
+    *, admission_adapter=None, identity_adapter=None
+) -> None:
+    """Install the supplied staff identity/admission seams for this process."""
+    global _MANAGED_STAFF_ADMISSION_ADAPTER, _MANAGED_STAFF_IDENTITY_ADAPTER
+    _MANAGED_STAFF_ADMISSION_ADAPTER = admission_adapter
+    _MANAGED_STAFF_IDENTITY_ADAPTER = identity_adapter
+
+
+def _install_managed_staff_adapters() -> None:
+    if not _is_managed_staff_mode():
+        return
+    from hermes_cli.managed_staff import (
+        ManagedStaffBrokerClient,
+        load_managed_staff_config,
+        make_identity_resolver,
+    )
+
+    config = load_managed_staff_config()
+    broker = ManagedStaffBrokerClient(config)
+    configure_managed_staff_adapters(
+        admission_adapter=broker,
+        identity_adapter=make_identity_resolver(config),
+    )
+
+    from tools.mcp_tool import mcp_prefixed_tool_name
+    from tools.registry import registry
+
+    def _make_dispatch(operation_name: str):
+        def dispatch(args: dict, **kwargs: Any) -> str:
+            if not isinstance(args, dict):
+                raise TypeError("managed staff tool arguments must be an object")
+            session_id = str(kwargs.get("session_id") or "")
+            session = _sessions.get(session_id)
+            if session is None:
+                session = next(
+                    (
+                        record
+                        for record in _sessions.values()
+                        if record.get("session_key") == session_id
+                    ),
+                    None,
+                )
+            if session is None:
+                raise PermissionError("authenticated managed staff session is unavailable")
+            identity = _staff_identity_for_session(session)
+            result = broker._dispatch(operation_name, dict(args), identity)
+            return json.dumps(result, sort_keys=True, separators=(",", ":"))
+
+        return dispatch
+
+    operation_schemas = {
+        "scope_file_admit": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "string"},
+                "purpose": {
+                    "type": "string",
+                    "enum": [
+                        "catalogue",
+                        "document",
+                        "media",
+                        "supplier",
+                        "public-source",
+                        "user-automation",
+                    ],
+                },
+                "supplier_id": {"type": "string"},
+                "supplier_domain": {"type": "string"},
+                "declared_mime": {"type": "string"},
+            },
+            "required": ["attachment_id", "purpose"],
+            "additionalProperties": False,
+        },
+        "scope_run_job": {
+            "type": "object",
+            "properties": {
+                "profile": {"type": "string"},
+                "attachment_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "purpose": {
+                    "type": "string",
+                    "enum": [
+                        "catalogue",
+                        "document",
+                        "media",
+                        "supplier",
+                        "public-source",
+                        "user-automation",
+                    ],
+                },
+            },
+            "required": ["profile", "attachment_ids", "purpose"],
+            "additionalProperties": False,
+        },
+        "run_user_automation": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string"},
+                "input_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["skill_id", "input_ids"],
+            "additionalProperties": False,
+        },
+    }
+    for operation in ("scope_file_admit", "scope_run_job", "run_user_automation"):
+        name = mcp_prefixed_tool_name("staff_runtime", operation)
+        registry.register(
+            name=name,
+            toolset="mcp-staff_runtime",
+            schema={
+                "name": name,
+                "description": f"Authenticated managed staff operation {operation}",
+                "parameters": operation_schemas[operation],
+            },
+            handler=_make_dispatch(operation),
+            is_async=False,
+            description=f"Authenticated managed staff operation {operation}",
+        )
+
+
+def _is_managed_staff_mode() -> bool:
+    return is_truthy_value(os.environ.get("HERMES_MANAGED_STAFF_MODE", ""))
+
+
+def _managed_staff_config() -> dict:
+    from hermes_cli.managed_staff import load_managed_staff_config
+
+    return load_managed_staff_config()
+
+
+def _managed_staff_list(value: Any, field: str) -> list[str]:
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        items = [str(part).strip() for part in value]
+    else:
+        raise ValueError(f"managed staff {field} inventory must be a list")
+    if not items or any(not item for item in items):
+        raise ValueError(f"managed staff {field} inventory is empty")
+    if len(set(items)) != len(items):
+        raise ValueError(f"managed staff {field} inventory contains duplicates")
+    return items
+
+
+def _load_managed_staff_inventory() -> tuple[str, list[str], set[str]]:
+    cfg = _managed_staff_config()
+    plane = cfg["plane"]
+    if plane not in _MANAGED_STAFF_PLANES:
+        raise ValueError("managed staff plane must be exactly internal or external")
+    product_id = cfg["product_id"]
+    expected_product = (
+        "uk.co.scopefurnishing.hermes.internal"
+        if plane == "internal"
+        else "uk.co.scopefurnishing.hermes.external"
+    )
+    if product_id != expected_product:
+        raise ValueError("managed staff product_id does not match plane")
+
+    servers = cfg["toolsets"]
+    if not isinstance(servers, dict):
+        raise ValueError("managed staff toolsets must be a server mapping")
+    expected_servers = {
+        name[4:] for name in _MANAGED_STAFF_TOOLSETS[plane] if name.startswith("mcp-")
+    }
+    if set(servers) != expected_servers:
+        raise ValueError(
+            "managed staff MCP server inventory does not match plane "
+            f"{plane}: expected {sorted(expected_servers)}, got {sorted(servers)}"
+        )
+
+    from tools.mcp_tool import mcp_prefixed_tool_name
+    from tools.registry import registry
+
+    expected_tools = {
+        mcp_prefixed_tool_name(server, method)
+        for server, methods in servers.items()
+        for method in methods
+    }
+    for server, methods in servers.items():
+        expected_server_tools = {
+            mcp_prefixed_tool_name(server, method) for method in methods
+        }
+        registered_server_tools = set(
+            registry.get_tool_names_for_toolset(f"mcp-{server}")
+        )
+        if registered_server_tools != expected_server_tools:
+            raise ValueError(
+                f"managed staff method inventory for {server} does not match "
+                "the complete registered method set"
+            )
+    for name in expected_tools:
+        if registry.get_toolset_for_tool(name) is None:
+            raise ValueError(f"unknown managed staff method: {name}")
+    available = {
+        definition["function"]["name"]
+        for definition in registry.get_definitions(expected_tools, quiet=True)
+    }
+    if available != expected_tools:
+        raise ValueError("managed staff method inventory does not match discovered methods")
+    return plane, sorted(_MANAGED_STAFF_TOOLSETS[plane]), expected_tools
+
+
 def _load_enabled_toolsets() -> list[str] | None:
+    if _is_managed_staff_mode():
+        _install_managed_staff_adapters()
+        _plane, toolsets, _methods = _load_managed_staff_inventory()
+        return toolsets
+
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -4165,7 +4476,6 @@ def _load_enabled_toolsets() -> list[str] | None:
 
         if valid:
             return valid
-
         fallback_notice = (
             "[tui] no valid HERMES_TUI_TOOLSETS entries; using configured CLI toolsets"
         )
@@ -4202,6 +4512,140 @@ def _load_enabled_toolsets() -> list[str] | None:
                 flush=True,
             )
         return None
+
+
+def _managed_profile_id(value: str | None) -> str:
+    candidate = str(value or "default").strip()
+    return (
+        "default"
+        if candidate in {
+            "internal-office-offline",
+            "external-web-offline",
+            "external-web-networked",
+            "external-media",
+        }
+        else candidate
+    )
+def _managed_staff_session_state(
+    session_id: str, profile_id: str | None
+) -> dict[str, Any]:
+    if not _is_managed_staff_mode():
+        return {}
+    principal = current_ws_principal()
+    if principal is None:
+        raise RuntimeError("verified WS principal is required")
+    config = _managed_staff_config()
+    expected_oidc = config["oidc"]
+    if (
+        principal.get("subject") != expected_oidc["subject"]
+        or principal.get("provider") != expected_oidc["provider"]
+        or principal.get("user_id") != config["user_id"]
+    ):
+        raise RuntimeError("verified WS principal does not match managed binding")
+    session_expires_at = principal.get("session_expires_at")
+    if (
+        isinstance(session_expires_at, bool)
+        or not isinstance(session_expires_at, (int, float))
+        or session_expires_at <= time.time()
+    ):
+        raise RuntimeError("verified WS principal expiry is invalid")
+    profile = _managed_profile_id(profile_id)
+    if not profile:
+        raise RuntimeError("managed staff profile_id is invalid")
+    from hermes_cli.managed_staff import get_managed_staff_session
+
+    state = get_managed_staff_session(
+        config,
+        session_id=session_id,
+        profile_id=profile,
+        session_expires_at=float(session_expires_at),
+    )
+    return {"managed_staff_session": state}
+
+def _staff_identity_for_session(session: dict) -> dict[str, str]:
+    adapter = _MANAGED_STAFF_IDENTITY_ADAPTER
+    if not callable(adapter):
+        raise RuntimeError("managed staff identity adapter is unavailable")
+    identity = adapter(session)
+    if not isinstance(identity, dict):
+        try:
+            identity = {
+                key: getattr(identity, key)
+                for key in (
+                    "subject",
+                    "user_id",
+                    "plane",
+                    "instance_id",
+                    "product_id",
+                    "connection_id",
+                    "profile_id",
+                    "session_id",
+                    "broker_namespace",
+                )
+            }
+        except AttributeError as exc:
+            raise RuntimeError("managed staff identity is unavailable") from exc
+    required = (
+        "subject",
+        "user_id",
+        "plane",
+        "instance_id",
+        "product_id",
+        "connection_id",
+        "profile_id",
+        "session_id",
+        "broker_namespace",
+    )
+    if set(identity) != set(required) or any(
+        not isinstance(identity.get(key), str) or not identity[key].strip()
+        for key in required
+    ):
+        raise RuntimeError("managed staff identity tuple is invalid")
+    if identity["plane"] not in _MANAGED_STAFF_PLANES:
+        raise RuntimeError("managed staff identity plane is invalid")
+    expected_product = (
+        "uk.co.scopefurnishing.hermes.internal"
+        if identity["plane"] == "internal"
+        else "uk.co.scopefurnishing.hermes.external"
+    )
+    if identity["product_id"] != expected_product:
+        raise RuntimeError("managed staff identity product is invalid")
+    return {key: identity[key] for key in required}
+
+
+def _staff_admit_attachment(
+    session: dict,
+    *,
+    data: bytes,
+    filename: str,
+    purpose: str = "",
+    supplier_id: str = "",
+    supplier_domain: str = "",
+    declared_mime: str = "",
+) -> Any:
+    adapter = _MANAGED_STAFF_ADMISSION_ADAPTER
+    if adapter is None:
+        raise RuntimeError("managed staff admission adapter is unavailable")
+    identity = _staff_identity_for_session(session)
+    method = getattr(adapter, "staff_admit_attachment", None)
+    if not callable(method):
+        method = getattr(adapter, "admit_attachment", None)
+    if not callable(method):
+        method = adapter if callable(adapter) else None
+    if method is None:
+        raise RuntimeError("managed staff admission adapter is invalid")
+    with tempfile.NamedTemporaryFile(prefix="hermes-staff-attach-", suffix=".upload") as fh:
+        fh.write(data)
+        fh.flush()
+        return method(
+            identity=identity,
+            source_path=Path(fh.name),
+            filename=filename,
+            purpose=purpose,
+            supplier_id=supplier_id,
+            supplier_domain=supplier_domain,
+            declared_mime=declared_mime,
+        )
 
 
 def _session_tool_progress_mode(sid: str) -> str:
@@ -6507,6 +6951,10 @@ def _init_session(
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
+            **_managed_staff_session_state(
+                key,
+                Path(profile_home).name if profile_home else None,
+            ),
         }
     _init_owns_db = False
     if session_db is not None:
@@ -7706,6 +8154,10 @@ def _deferred_session_record(
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
+        **_managed_staff_session_state(
+            session_key,
+            profile_home.name if profile_home is not None else None,
+        ),
     }
 
 
@@ -13893,6 +14345,14 @@ from . import (  # noqa: E402
     methods_session as _methods_session,
     methods_tools as _methods_tools,
 )
+from .methods_prompt import (
+    _managed_attachment_receipt,
+    _managed_prompt_attachments,
+)
+
+
+if _is_managed_staff_mode():
+    _install_managed_staff_adapters()
 
 for _m in (
     _methods_session,

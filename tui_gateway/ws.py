@@ -283,8 +283,10 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any, *, principal: dict[str, Any] | None = None
+) -> None:
+    """Run one WebSocket session with its server-verified principal."""
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -381,6 +383,15 @@ async def handle_ws(ws: Any) -> None:
                     break
                 continue
 
+            if (
+                server._is_managed_staff_mode()
+                and not await asyncio.to_thread(
+                    server.ws_principal_is_active, principal
+                )
+            ):
+                disconnect_reason = "managed_session_revoked_or_expired"
+                _log.info("ws managed principal became inactive peer=%s", peer)
+                break
             # dispatch() may schedule long handlers on the pool; it returns
             # None in that case and the worker writes the response itself via
             # the transport we pass in (a separate thread, so transport.write
@@ -389,7 +400,9 @@ async def handle_ws(ws: Any) -> None:
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await asyncio.to_thread(
+                    server.dispatch, req, transport, principal=principal
+                )
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

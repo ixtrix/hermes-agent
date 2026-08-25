@@ -23,6 +23,12 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    # Verified OIDC subject, when the provider has one.  This is deliberately
+    # separate from ``user_id``: managed deployments map the claim subject to
+    # a server-owned business user id.
+    subject: str = ""
+    # Stable server-side session handle for this authenticated token/session.
+    session_id: str = ""
 
 
 @dataclass(frozen=True)

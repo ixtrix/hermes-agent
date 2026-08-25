@@ -16,6 +16,7 @@ The routes:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict, deque
@@ -53,10 +54,31 @@ _log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _redirect_uri(request: Request) -> str:
-    """Reconstruct the absolute callback URL the IDP redirects back to.
+def _managed_oidc() -> dict[str, str] | None:
+    if os.environ.get("HERMES_MANAGED_STAFF_MODE", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    try:
+        from hermes_cli.managed_staff import load_managed_staff_config
 
-    Three resolution tiers:
+        return load_managed_staff_config()["oidc"]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="managed OIDC configuration unavailable"
+        ) from exc
+
+
+def _redirect_uri(
+    request: Request, managed_oidc: dict[str, str] | None = None
+) -> str:
+    """Return the configured managed callback or reconstruct an ordinary one.
+
+    Managed staff mode always returns the root-owned configured redirect URI;
+    request/proxy authority is ignored. Ordinary mode has three resolution tiers:
 
       1. ``HERMES_DASHBOARD_PUBLIC_URL`` env var or
          ``dashboard.public_url`` in config.yaml — when set, this is
@@ -85,6 +107,10 @@ def _redirect_uri(request: Request) -> str:
         prefix_from_request,
         resolve_public_url,
     )
+
+    managed_oidc = managed_oidc if managed_oidc is not None else _managed_oidc()
+    if managed_oidc is not None:
+        return managed_oidc["redirect_uri"]
 
     # Tier 1: operator-declared public URL.
     public_url = resolve_public_url()
@@ -285,7 +311,6 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
         )
     return raw
 
-
 @router.get("/auth/native/authorize", name="auth_native_authorize")
 async def auth_native_authorize(
     request: Request,
@@ -305,6 +330,7 @@ async def auth_native_authorize(
     cookie flow uses. On the callback we mint a loopback code (see
     ``auth_callback``); no browser session cookie is ever set for the desktop.
     """
+    managed_oidc = _managed_oidc()
     # PKCE method must be S256 (RFC 7636 — plain is disallowed for native apps).
     if code_challenge_method.upper() != "S256":
         raise HTTPException(
@@ -318,8 +344,10 @@ async def auth_native_authorize(
     # Resolve the provider. With exactly one session provider registered
     # (the common hosted case) an empty ``provider`` selects it, mirroring
     # the auto-SSO convenience so the desktop needn't hardcode the name.
-    p = get_provider(provider) if provider else None
-    if p is None and not provider:
+    p = get_provider(
+        provider or (managed_oidc["provider"] if managed_oidc is not None else "")
+    ) if (provider or managed_oidc is not None) else None
+    if p is None and not provider and managed_oidc is None:
         sess_providers = list_session_providers()
         if len(sess_providers) == 1:
             p = sess_providers[0]
@@ -327,6 +355,13 @@ async def auth_native_authorize(
         raise HTTPException(
             status_code=404, detail=f"Unknown provider: {provider!r}"
         )
+    if managed_oidc is not None:
+        from hermes_cli.managed_staff import managed_staff_provider_matches
+
+        if provider and provider != managed_oidc["provider"]:
+            raise HTTPException(status_code=400, detail="managed provider binding mismatch")
+        if not managed_staff_provider_matches(p, managed_oidc):
+            raise HTTPException(status_code=503, detail="managed OIDC provider is not bound")
     if not getattr(p, "supports_session", True) or getattr(
         p, "supports_password", False
     ):
@@ -350,7 +385,7 @@ async def auth_native_authorize(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        ls = p.start_login(redirect_uri=_redirect_uri(request))
+        ls = p.start_login(redirect_uri=_redirect_uri(request, managed_oidc))
     except ProviderError as e:
         raise HTTPException(status_code=503, detail=f"Provider unreachable: {e}")
 
@@ -423,6 +458,18 @@ async def auth_callback(
             status_code=400,
             detail=f"Unknown provider in cookie: {provider_name!r}",
         )
+    managed_oidc = _managed_oidc()
+    if managed_oidc is not None:
+        from hermes_cli.managed_staff import managed_staff_provider_matches
+
+        if provider_name != managed_oidc["provider"]:
+            raise HTTPException(
+                status_code=400, detail="managed provider binding mismatch"
+            )
+        if not managed_staff_provider_matches(p, managed_oidc):
+            raise HTTPException(
+                status_code=503, detail="managed OIDC provider is not bound"
+            )
 
     if error:
         audit_log(
@@ -454,7 +501,7 @@ async def auth_callback(
             code=code,
             state=state,
             code_verifier=verifier,
-            redirect_uri=_redirect_uri(request),
+            redirect_uri=_redirect_uri(request, managed_oidc),
         )
     except InvalidCodeError as e:
         audit_log(
@@ -805,9 +852,11 @@ async def api_auth_ws_ticket(request: Request):
     append to ``/api/pty``, ``/api/console``, ``/api/ws``, ``/api/pub``, or
     ``/api/events``.
 
-    The ticket has a 30-second TTL and is single-use. Calling this endpoint
-    multiple times in quick succession (e.g. one ticket per WS) is the
-    expected pattern.
+    The ticket has a 30-second consume TTL and is single-use. The
+    authenticated session expiry is carried separately, so a consumed
+    connection remains authorized until that verified session expires.
+    Calling this endpoint multiple times in quick succession (e.g. one
+    ticket per WS) is the expected pattern.
     """
     sess = getattr(request.state, "session", None)
     if sess is None:
@@ -818,7 +867,14 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        subject=getattr(sess, "subject", "") or None,
+        session_expires_at=sess.expires_at,
+        session_id=getattr(sess, "session_id", "") or None,
+        access_token=getattr(sess, "access_token", "") or None,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

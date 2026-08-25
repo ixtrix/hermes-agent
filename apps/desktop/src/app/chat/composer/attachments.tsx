@@ -9,6 +9,7 @@ import { useImageDownload } from '@/hooks/use-image-download'
 import { useI18n } from '@/i18n'
 import { AlertCircle, FileText, FolderOpen, ImageIcon, Link, Loader2, Terminal } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
@@ -39,7 +40,11 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
   const cwd = useStore(useSessionView().$cwd)
   const isUploading = attachment.uploadState === 'uploading'
   const hasUploadError = attachment.uploadState === 'error'
-  const canPreview = attachment.kind !== 'folder' && attachment.kind !== 'terminal' && !isUploading
+  const canPreview =
+    attachment.kind !== 'folder' &&
+    attachment.kind !== 'terminal' &&
+    !(isManagedProductBuild && attachment.kind !== 'image') &&
+    !isUploading
   const detail = attachment.detail && attachment.detail !== attachment.label ? attachment.detail : undefined
   // An attached image already holds its full bytes as a data URL, so it belongs
   // in the same lightbox the thread uses. The rail is for files you read or
@@ -60,12 +65,13 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
       return
     }
 
-    const rawTarget =
-      attachment.path ||
-      attachment.detail ||
-      attachment.refText?.replace(/^@(file|image|url):/, '') ||
-      attachment.label ||
-      ''
+    const rawTarget = isManagedProductBuild
+      ? ''
+      : attachment.path ||
+        attachment.detail ||
+        attachment.refText?.replace(/^@(file|image|url):/, '') ||
+        attachment.label ||
+        ''
 
     const target = rawTarget.replace(/^`|`$/g, '')
 

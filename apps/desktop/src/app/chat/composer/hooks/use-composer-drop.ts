@@ -1,6 +1,7 @@
 import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
+import { isManagedProductBuild } from '@/lib/managed-product'
 
 import { extractDroppedFiles, HERMES_PATHS_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
 import { dragHasAttachments, droppedFileInlineRefs, type InlineRefInput } from '../inline-refs'
@@ -88,7 +89,7 @@ export function useComposerDrop({
     // drops are absolute local paths a remote gateway can't read (and images
     // need byte upload for vision), so route them through the upload pipeline.
     const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
-    const refs = droppedFileInlineRefs(inAppRefs, cwd)
+    const refs = isManagedProductBuild ? [] : droppedFileInlineRefs(inAppRefs, cwd)
 
     if (refs.length && insertInlineRefs(refs)) {
       triggerHaptic('selection')
@@ -134,16 +135,17 @@ export function useComposerDrop({
     // can't read and whose image bytes never reached vision. Split by origin:
     // in-app drags stay inline refs; OS drops go through the upload pipeline.
     // (When no upload handler is wired, fall back to inline refs for all.)
-    const attach = onAttachDroppedItems
     const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
-    const refs = droppedFileInlineRefs(attach ? inAppRefs : candidates, cwd)
+    const refs = isManagedProductBuild
+      ? []
+      : droppedFileInlineRefs(onAttachDroppedItems ? inAppRefs : candidates, cwd)
 
     if (refs.length && insertInlineRefs(refs)) {
       triggerHaptic('selection')
     }
 
-    if (attach && osDrops.length) {
-      void Promise.resolve(attach(osDrops)).then(attached => {
+    if (onAttachDroppedItems && osDrops.length) {
+      void Promise.resolve(onAttachDroppedItems(osDrops)).then(attached => {
         if (attached) {
           triggerHaptic('selection')
           requestMainFocus()

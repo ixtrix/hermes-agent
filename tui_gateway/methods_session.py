@@ -107,6 +107,10 @@ def _(rid, params: dict) -> dict:
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
+            **_managed_staff_session_state(
+                key,
+                Path(profile_home).name if profile_home else None,
+            ),
         }
         _register_session_cwd(_sessions[sid])
 

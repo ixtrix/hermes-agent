@@ -5,6 +5,7 @@ import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   isVoicePlaybackActive,
@@ -89,6 +90,46 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   setAwaitingResponse,
   setBusy,
   setMessages
+}
+interface ManagedPromptAttachment {
+  attachment_id: string
+  metadata: Record<string, string | number>
+  mime_type: string
+  name: string
+  size: number
+}
+
+function managedPromptAttachments(attachments: ComposerAttachment[]): ManagedPromptAttachment[] {
+  const attachable = attachments.filter(attachment => attachment.kind === 'image' || attachment.kind === 'file')
+
+  if (attachable.some(attachment => !attachment.receipt || attachment.receipt.attached !== true)) {
+    throw new Error('Managed attachments were not admitted')
+  }
+
+  return attachable.flatMap(attachment => {
+    const receipt = attachment.receipt
+    return receipt
+      ? [
+          {
+            attachment_id: receipt.attachment_id,
+            metadata: {
+              ...receipt.metadata,
+              mime_type: receipt.mime,
+              purpose: receipt.purpose,
+              ...(receipt.supplier
+                ? {
+                    supplier_domain: receipt.supplier.supplier_domain,
+                    supplier_id: receipt.supplier.supplier_id
+                  }
+                : {})
+            },
+            mime_type: receipt.mime,
+            name: receipt.name,
+            size: receipt.size
+          }
+        ]
+      : []
+  })
 }
 
 /** The prompt submit pipeline, extracted from usePromptActions. */
@@ -602,10 +643,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(sessionId)
         const text = buildContextText(syncedAttachments)
+        const managedAttachments = isManagedProductBuild ? managedPromptAttachments(syncedAttachments) : undefined
 
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          ...(isManagedProductBuild ? { attachments: managedAttachments ?? [] } : {}),
           ...(interrupted && { interrupted }),
           // A queue drain is a "run after" message, never a live-turn
           // correction. The flag tells the gateway's busy path to hold it for

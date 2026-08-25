@@ -13,6 +13,7 @@ import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from
 import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
@@ -75,7 +76,24 @@ import type { ClientSessionState } from '../../../types'
 import { finalizeInterruptedMessages } from '../use-prompt-actions/rewind'
 
 import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
+const MANAGED_PRODUCT_BUILD = isManagedProductBuild
 
+export const MANAGED_CALLBACK_ALLOWLIST = new Set<string>()
+
+export function shouldRejectManagedBridgeEvent(type: unknown, managed = MANAGED_PRODUCT_BUILD): boolean {
+  return (
+    managed &&
+    typeof type === 'string' &&
+    !MANAGED_CALLBACK_ALLOWLIST.has(type) &&
+    /callback|bridge|app(?:[.:_-]control)/i.test(type)
+  )
+}
+
+function auditRejectedManagedBridgeEvent(type: unknown): void {
+  console.warn('[hermes] rejected managed Desktop bridge event', {
+    type: typeof type === 'string' ? type : '<unknown>'
+  })
+}
 function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
 }
@@ -253,6 +271,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
   return useCallback(
     (event: RpcEvent) => {
+      if (shouldRejectManagedBridgeEvent(event.type)) {
+        auditRejectedManagedBridgeEvent(event.type)
+
+        return
+      }
+
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
 

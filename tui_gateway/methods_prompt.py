@@ -6,47 +6,40 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 
 from .method_ctx import HandlerRegistry
 
-import types
 
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
-def _pending_reaction_notes(session: dict) -> str:
-    """Note block describing reactions the user added since the last turn, or "".
 
-    Applied to the MODEL INPUT only (``run_message``, beside the
-    speech-interrupted note) — never to the text that gets persisted. Prefixing
-    the persisted prompt bakes scaffolding into the transcript, which every
-    surface then renders as a garbled user message on reload. Each reaction is
-    announced once — the row is stamped ``seen`` on read.
-    """
+def _pending_reaction_notes(
+    session: dict,
+    *,
+    load_cfg,
+    session_db,
+    log,
+) -> str:
+    """Return unseen reaction notes using the owning server's helpers."""
     session_key = str(session.get("session_key") or "")
     if not session_key:
         return ""
-
-    # Feature-gated (off by default, Settings → Appearance): when disabled the
-    # model hears nothing, even about reactions set while it was on.
     try:
-        display = _load_cfg().get("display")
+        display = load_cfg().get("display")
         if not (isinstance(display, dict) and bool(display.get("message_reactions", False))):
             return ""
     except Exception:
         return ""
-
     try:
-        with _session_db(session) as db:
+        with session_db(session) as db:
             if db is None:
                 return ""
             pending = db.take_unseen_reactions(session_key, author="user")
     except Exception:
-        logger.debug("Failed to read pending reactions", exc_info=True)
+        log.debug("Failed to read pending reactions", exc_info=True)
         return ""
-
     if not pending:
         return ""
-
     notes = []
     for entry in pending:
         snippet = (entry.get("text") or "").strip().replace("\n", " ")
@@ -57,10 +50,7 @@ def _pending_reaction_notes(session: dict) -> str:
         if snippet:
             notes.append(f'[The user reacted {emoji} to {whose} message: "{snippet}"]')
         else:
-            # A row with no plain text (attachment-only, or a tool-call-only
-            # assistant turn) — an empty quote reads worse than no quote.
             notes.append(f"[The user reacted {emoji} to {whose} earlier message]")
-
     return "\n".join(notes)
 
 
@@ -111,6 +101,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        try:
+            session["_managed_prompt_attachments"] = _managed_prompt_attachments(
+                session, params.get("attachments")
+            )
+        except Exception:
+            return _err(rid, 4015, "invalid managed attachment descriptors")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
@@ -333,11 +330,170 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+
+def _managed_attachment_receipt(
+    session: dict, params: dict, *, default_mime: str = ""
+) -> dict:
+    import base64
+    import binascii
+    from hermes_cli.managed_staff import STAFF_PURPOSES
+    declared_mime = ""
+
+    encoded = params.get("bytes")
+    if encoded is None:
+        encoded = params.get("content_base64") or params.get("data") or params.get("data_url")
+    if isinstance(encoded, list) and all(isinstance(item, int) and 0 <= item <= 255 for item in encoded):
+        data = bytes(encoded)
+    elif isinstance(encoded, str):
+        raw = encoded.strip()
+        if raw.startswith("data:") and "," in raw:
+            header, raw = raw.split(",", 1)
+            declared_mime = header[5:].split(";", 1)[0].strip().lower()
+        else:
+            declared_mime = ""
+        try:
+            data = base64.b64decode(raw, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("attachment bytes must be base64") from exc
+    else:
+        raise ValueError("attachment bytes are required")
+    if not data:
+        raise ValueError("attachment is empty")
+    claimed_size = params.get("size")
+    if claimed_size is not None and int(claimed_size) != len(data):
+        raise ValueError("attachment size does not match bytes")
+    purpose = str(params.get("purpose") or "").strip()
+    if purpose not in STAFF_PURPOSES:
+        raise ValueError("attachment purpose is not approved")
+    supplier_id = str(params.get("supplier_id") or "").strip()
+    supplier_domain = str(params.get("supplier_domain") or "").strip()
+    if purpose == "supplier" and (not supplier_id or not supplier_domain):
+        raise ValueError("supplier attachment supplier metadata is required")
+    declared_mime = str(
+        params.get("mime_type") or default_mime or declared_mime
+    ).strip().lower()
+    filename = str(params.get("name") or params.get("filename") or "attachment").strip()
+    admit = _staff_admit_attachment
+    receipt = admit(
+        session,
+        data=data,
+        filename=filename,
+        purpose=purpose,
+        supplier_id=supplier_id,
+        supplier_domain=supplier_domain,
+        declared_mime=declared_mime,
+    )
+    if isinstance(receipt, dict):
+        metadata = dict(receipt)
+    elif hasattr(receipt, "__dict__"):
+        metadata = dict(vars(receipt))
+    else:
+        metadata = {}
+        for key in (
+            "attachment_id", "name", "size", "size_bytes", "mime_type",
+            "declared_mime", "detected_mime", "purpose", "supplier_id",
+            "supplier_domain", "expires_at", "state",
+        ):
+            if hasattr(receipt, key):
+                metadata[key] = getattr(receipt, key)
+    if any(key in metadata for key in ("path", "file_path", "ref_path", "namespace")):
+        raise ValueError("attachment admission returned forbidden fields")
+    receipt_metadata = metadata.get("metadata")
+    if not isinstance(receipt_metadata, dict):
+        receipt_metadata = {}
+    observed_purpose = metadata.get("purpose", receipt_metadata.get("purpose"))
+    if observed_purpose != purpose:
+        raise ValueError("attachment admission purpose mismatch")
+    for field, expected in (
+        ("supplier_id", supplier_id),
+        ("supplier_domain", supplier_domain),
+    ):
+        if expected and metadata.get(field, receipt_metadata.get(field)) != expected:
+            raise ValueError(f"attachment admission {field} mismatch")
+    attachment_id = metadata.get("attachment_id") or metadata.get("receipt_id") or metadata.get("id")
+    if not attachment_id:
+        raise ValueError("attachment admission returned no receipt")
+    name = str(metadata.get("name") or filename).replace("\\", "/").rsplit("/", 1)[-1]
+    size = metadata.get("size", metadata.get("size_bytes", len(data)))
+    mime_type = str(
+        metadata.get("mime_type")
+        or metadata.get("detected_mime")
+        or metadata.get("declared_mime")
+        or declared_mime
+    ).strip().lower()
+    allowed_metadata = {
+        "purpose", "supplier_id", "supplier_domain", "expires_at", "state",
+        "declared_mime", "detected_mime",
+    }
+    safe_metadata = {
+        key: value for key, value in metadata.items()
+        if key in allowed_metadata and value is not None
+    }
+    if "/" not in mime_type:
+        raise ValueError("attachment MIME type is required")
+    return {
+        "attached": True,
+        "attachment_id": str(attachment_id),
+        "name": name,
+        "size": int(size),
+        "mime_type": mime_type,
+        "metadata": safe_metadata,
+    }
+
+def _managed_prompt_attachments(session: dict, value: object) -> list[dict]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attachments must be a list")
+    identity_lookup = _staff_identity_for_session
+    identity_lookup(session)
+    result: list[dict] = []
+    required = {"attachment_id", "name", "size", "mime_type", "metadata"}
+    for item in value:
+        if not isinstance(item, dict) or set(item) != required:
+            raise ValueError("attachment descriptors have an invalid shape")
+        if any(key in item for key in ("path", "ref_path", "namespace", "identity")):
+            raise ValueError("attachment descriptor contains forbidden fields")
+        attachment_id = str(item["attachment_id"]).strip()
+        name = str(item["name"]).replace("\\", "/").rsplit("/", 1)[-1].strip()
+        mime_type = str(item["mime_type"]).strip().lower()
+        if not attachment_id or not name or "/" not in mime_type:
+            raise ValueError("attachment descriptor is incomplete")
+        if not isinstance(item["size"], int) or item["size"] < 0:
+            raise ValueError("attachment descriptor size is invalid")
+        metadata = item["metadata"]
+        if not isinstance(metadata, dict) or any(
+            key in metadata for key in ("path", "file_path", "namespace", "identity")
+        ):
+            raise ValueError("attachment metadata contains forbidden fields")
+        result.append(
+            {
+                "attachment_id": attachment_id,
+                "name": name,
+                "size": item["size"],
+                "mime_type": mime_type,
+                "metadata": dict(metadata),
+            }
+        )
+    return result
+
 @method("clipboard.paste")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        if params.get("bytes") is None and not params.get("content_base64") and not params.get("data"):
+            return _err(rid, 4015, "clipboard image bytes are required in managed staff mode")
+        try:
+            receipt = _managed_attachment_receipt(
+                session,
+                {**params, "name": params.get("name") or "clipboard.png", "mime_type": "image/png"},
+                default_mime="image/png",
+            )
+        except Exception:
+            return _err(rid, 5028, "attachment admission failed")
+        return _ok(rid, receipt)
     try:
         from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
     except Exception as e:
@@ -378,6 +534,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        if str(params.get("path", "") or "").strip():
+            return _err(rid, 4015, "path is not accepted in managed staff mode")
+        try:
+            receipt = _managed_attachment_receipt(
+                session, params, default_mime="image/octet-stream"
+            )
+        except Exception:
+            return _err(rid, 5028, "attachment admission failed")
+        return _ok(rid, receipt)
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
@@ -436,6 +602,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        if str(params.get("path", "") or "").strip():
+            return _err(rid, 4015, "path is not accepted in managed staff mode")
+        try:
+            receipt = _managed_attachment_receipt(
+                session, params, default_mime="image/octet-stream"
+            )
+        except Exception:
+            return _err(rid, 5028, "attachment admission failed")
+        return _ok(rid, receipt)
 
     raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
     if not raw_b64:
@@ -496,6 +672,16 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        if str(params.get("path", "") or "").strip():
+            return _err(rid, 4015, "path is not accepted in managed staff mode")
+        try:
+            receipt = _managed_attachment_receipt(
+                session, params, default_mime="application/pdf"
+            )
+        except Exception:
+            return _err(rid, 5028, "attachment admission failed")
+        return _ok(rid, receipt)
 
     if shutil.which("pdftoppm") is None:
         return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
@@ -605,26 +791,20 @@ def _(rid, params: dict) -> dict:
 
 @method("file.attach")
 def _(rid, params: dict) -> dict:
-    """Stage a non-image file attachment into the session workspace.
-
-    The image/PDF path renders to vision tiles; this one keeps the file as a
-    readable artifact and returns a workspace-relative ``@file:`` ref so the
-    agent's file tools (and ``agent.context_references``) can read it. Solves the
-    remote-gateway case where the desktop passes a path that only exists on the
-    CLIENT's disk: the client uploads ``data_url`` bytes and we materialize the
-    file on the gateway.
-
-    Params:
-      session_id (str, required)
-      path (str): client/host path of the file (used for naming + local-mode
-        gateway-visible resolution).
-      data_url (str): ``data:<mime>;base64,<b64>`` upload of the file bytes,
-        required when the path isn't visible to the gateway.
-      name (str, optional): preferred filename.
-    """
+    """Attach a file through the active local or managed admission path."""
     session, err = _sess(params, rid)
     if err:
         return err
+
+    if _is_managed_staff_mode():
+        if str(params.get("path", "") or "").strip():
+            return _err(rid, 4015, "path is not accepted in managed staff mode")
+        try:
+            receipt = _managed_attachment_receipt(session, params)
+        except Exception:
+            return _err(rid, 5028, "attachment admission failed")
+        return _ok(rid, receipt)
+
     raw = str(params.get("path", "") or "").strip()
     data_url = str(params.get("data_url", "") or "").strip()
     name = str(params.get("name", "") or "").strip()
@@ -655,6 +835,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        return _err(rid, 4015, "path is not accepted in managed staff mode")
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
@@ -675,6 +857,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _is_managed_staff_mode():
+        return _err(rid, 4015, "path drops are not accepted in managed staff mode")
     try:
         from cli import _detect_file_drop
 
@@ -927,15 +1111,20 @@ def _(rid, params: dict) -> dict:
 
 
 def register(server) -> None:
-    """Bind this module's handlers onto ``server``'s globals and registry."""
+    """Bind handlers and server callbacks used by managed attachment helpers."""
     _registry.install(server)
-    # Module-level helpers aren't @method handlers, so install() doesn't see
-    # them — but server.py's run path calls this one (run_message enrichment,
-    # beside the speech-interrupted note). Rebind and publish it the same way.
-    server._pending_reaction_notes = types.FunctionType(
-        _pending_reaction_notes.__code__,
-        vars(server),
-        _pending_reaction_notes.__name__,
-        _pending_reaction_notes.__defaults__,
-        _pending_reaction_notes.__closure__,
-    )
+
+    def pending_reaction_notes(session: dict) -> str:
+        return _pending_reaction_notes(
+            session,
+            load_cfg=server._load_cfg,
+            session_db=server._session_db,
+            log=server.logger,
+        )
+
+    def managed_prompt_attachments(session: dict, value: object) -> list[dict]:
+        _registry.refresh(server, _managed_prompt_attachments)
+        return _managed_prompt_attachments(session, value)
+
+    server._pending_reaction_notes = pending_reaction_notes
+    server._managed_prompt_attachments = managed_prompt_attachments
