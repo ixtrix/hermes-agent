@@ -10,6 +10,7 @@ import { useI18n } from '@/i18n'
 import { readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { AlertCircle, FileText, FolderOpen, ImageIcon, Link, Loader2, MessageCode, Terminal } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
@@ -54,10 +55,14 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
   const isUploading = attachment.uploadState === 'uploading'
   const hasUploadError = attachment.uploadState === 'error'
 
-  // A review card's detail is its resolved-comment JSON, not a previewable
-  // path — clicking it should do nothing rather than toast a bogus failure.
+  // Review details are structured metadata, not previewable paths. Managed
+  // products admit image previews only; other files remain server-owned.
   const canPreview =
-    attachment.kind !== 'folder' && attachment.kind !== 'terminal' && attachment.kind !== 'review' && !isUploading
+    attachment.kind !== 'folder' &&
+    attachment.kind !== 'terminal' &&
+    attachment.kind !== 'review' &&
+    !(isManagedProductBuild && attachment.kind !== 'image') &&
+    !isUploading
 
   const detail =
     attachment.kind !== 'review' && attachment.detail && attachment.detail !== attachment.label
@@ -120,12 +125,13 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
       return
     }
 
-    const rawTarget =
-      attachment.path ||
-      attachment.detail ||
-      attachment.refText?.replace(/^@(file|image|url):/, '') ||
-      attachment.label ||
-      ''
+    const rawTarget = isManagedProductBuild
+      ? ''
+      : attachment.path ||
+        attachment.detail ||
+        attachment.refText?.replace(/^@(file|image|url):/, '') ||
+        attachment.label ||
+        ''
 
     const target = rawTarget.replace(/^`|`$/g, '')
 

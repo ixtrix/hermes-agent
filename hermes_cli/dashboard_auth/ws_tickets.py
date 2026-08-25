@@ -8,8 +8,9 @@ token — so this module provides two credential shapes:
 1. **Single-use browser tickets** (``mint_ticket`` / ``consume_ticket``).
    The SPA gets a fresh ticket via the authenticated REST endpoint
    ``POST /api/auth/ws-ticket`` and passes it as ``?ticket=`` on the WS
-   upgrade. Single-use, TTL = 30 seconds — a leaked ticket is uninteresting.
-
+   upgrade. Single-use, TTL = 30 seconds, and bound to the verified
+   ``user_id``/provider/subject plus the authenticated session expiry.
+   The 30-second consume deadline remains private to the ticket store.
 2. **A process-lifetime internal credential** (``internal_ws_credential`` /
    ``consume_internal_credential``). This authenticates *server-spawned*
    WS clients — specifically the embedded-TUI PTY child, which attaches to
@@ -42,7 +43,7 @@ from typing import Any, Dict, Optional, Tuple
 TTL_SECONDS = 30
 
 _lock = threading.Lock()
-_tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
+_tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (ticket_expires_at, info)
 
 #: The process-lifetime internal credential (see module docstring). Lazily
 #: minted on first ``internal_ws_credential()`` call and stable for the life
@@ -59,31 +60,73 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
-    """Generate a one-shot ticket bound to this user identity.
+def mint_ticket(
+    *,
+    user_id: str,
+    provider: str,
+    subject: str | None = None,
+    session_expires_at: int | float,
+    session_id: str | None = None,
+    access_token: str | None = None,
+) -> str:
+    """Generate a one-shot ticket bound to this verified session.
 
-    The returned token is base64url, 43 bytes of entropy (32-byte random
-    seed). Stash returns the ``info`` dict to the caller on consume so the
-    WS handler can carry the identity forward into its session log.
+    ``session_expires_at`` is the authenticated OIDC/server session
+    deadline. It is carried in the consumed principal separately from the
+    short transport-ticket deadline, which is kept private to this store.
     """
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("ticket user_id is required")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError("ticket provider is required")
+    if subject is not None and (
+        not isinstance(subject, str) or not subject.strip()
+    ):
+        raise ValueError("ticket subject must be non-empty when supplied")
+    if (
+        isinstance(session_expires_at, bool)
+        or not isinstance(session_expires_at, (int, float))
+        or session_expires_at <= time.time()
+    ):
+        raise ValueError("authenticated session expiry must be in the future")
+    if session_id is not None and (
+        not isinstance(session_id, str) or not session_id.strip()
+    ):
+        raise ValueError("ticket session_id must be non-empty when supplied")
+    if access_token is not None and (
+        not isinstance(access_token, str) or not access_token.strip()
+    ):
+        raise ValueError("ticket access_token must be non-empty when supplied")
+
+    now = int(time.time())
+    verified_session_expires_at = float(session_expires_at)
+    ticket_expires_at = now + TTL_SECONDS
     ticket = secrets.token_urlsafe(32)
-    info = {
+    info: Dict[str, Any] = {
         "user_id": user_id,
         "provider": provider,
-        "minted_at": int(time.time()),
+        "minted_at": now,
+        "session_expires_at": verified_session_expires_at,
     }
+    if subject is not None:
+        info["subject"] = subject
+    if session_id is not None:
+        info["session_id"] = session_id
+    if access_token is not None:
+        # Kept in the in-memory ticket record solely for revalidation against
+        # the existing auth provider hook; never exposed as a WS principal.
+        info["_access_token"] = access_token
     with _lock:
-        _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
+        _tickets[ticket] = (ticket_expires_at, info)
         _gc_expired_locked()
     return ticket
 
 
 def consume_ticket(ticket: str) -> Dict[str, Any]:
-    """Validate and consume. Raises :class:`TicketInvalid` on missing/expired/used.
+    """Validate and consume a one-shot ticket.
 
-    Single-use semantics: a successful consume immediately removes the
-    ticket from the store, so a second call with the same value raises
-    ``TicketInvalid("unknown ticket: …")``.
+    The returned mapping contains the verified session identity and lifetime;
+    the one-use transport deadline is deliberately not returned.
     """
     now = int(time.time())
     with _lock:
@@ -93,16 +136,18 @@ def consume_ticket(ticket: str) -> Dict[str, Any]:
             # secret in full.
             truncated = (ticket[:8] + "…") if ticket else "<empty>"
             raise TicketInvalid(f"unknown ticket: {truncated}")
-        expires_at, info = entry
-        if expires_at < now:
+        ticket_expires_at, info = entry
+        if ticket_expires_at <= now:
             raise TicketInvalid("expired")
+        if float(info["session_expires_at"]) <= time.time():
+            raise TicketInvalid("authenticated session expired")
         return info
 
 
 def _gc_expired_locked() -> None:
     """Drop expired tickets. Caller must hold ``_lock``."""
     now = int(time.time())
-    expired = [t for t, (exp, _) in _tickets.items() if exp < now]
+    expired = [t for t, (exp, _) in _tickets.items() if exp <= now]
     for t in expired:
         _tickets.pop(t, None)
 

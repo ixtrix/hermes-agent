@@ -400,6 +400,24 @@ export function base64FromDataUrl(dataUrl: string): string {
 
   return comma >= 0 ? dataUrl.slice(comma + 1) : ''
 }
+export function base64FromBytes(bytes: Uint8Array): string {
+  let binary = ''
+
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  }
+
+  return btoa(binary)
+}
+
+export interface RemoteImageAttachPayload {
+  contentBase64: string
+  filename: string
+}
+
+export function dataUrlFromBytes(bytes: Uint8Array, mime: string): string {
+  return `data:${mime || 'application/octet-stream'};base64,${base64FromBytes(bytes)}`
+}
 
 export function imageFilenameFromPath(filePath: string): string {
   return filePath.split(/[\\/]/).filter(Boolean).pop() || 'image.png'
@@ -418,7 +436,7 @@ export function imageFilenameFromPath(filePath: string): string {
 export async function readImageForRemoteAttach(
   filePath: string,
   cachedDataUrl?: string
-): Promise<{ contentBase64: string; filename: string } | null> {
+): Promise<RemoteImageAttachPayload | null> {
   if (cachedDataUrl?.includes(';base64,')) {
     const cached = base64FromDataUrl(cachedDataUrl)
 
@@ -426,7 +444,6 @@ export async function readImageForRemoteAttach(
       return { contentBase64: cached, filename: imageFilenameFromPath(filePath) }
     }
   }
-
   const dataUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 

@@ -321,16 +321,14 @@ async def handle_ws(
     ws: Any,
     *,
     auth_identity: dict | None = None,
+    principal: dict[str, Any] | None = None,
     subprotocol: str | None = None,
 ) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+    """Run one WebSocket session with server-verified identity context.
 
-    *auth_identity* is the server-minted ``{user_id, provider}`` recorded at
-    WS-upgrade authentication (``hermes_cli.web_server._ws_auth_reason``); it
-    is stored on the transport as ``WSTransport.auth_identity`` and is the
-    only identity authority for browser-controller registration. Existing
-    callers (stdio-free harnesses, the embedded TUI child) omit it and get a
-    ``None`` transport identity — unchanged behaviour.
+    ``auth_identity`` is the narrow public controller identity, while
+    ``principal`` carries the managed session authority used for continuous
+    revocation checks and privileged dispatch.
     """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -454,6 +452,15 @@ async def handle_ws(
                     break
                 continue
 
+            if (
+                server._is_managed_staff_mode()
+                and not await asyncio.to_thread(
+                    server.ws_principal_is_active, principal
+                )
+            ):
+                disconnect_reason = "managed_session_revoked_or_expired"
+                _log.info("ws managed principal became inactive peer=%s", peer)
+                break
             # dispatch() may schedule long handlers on the pool; it returns
             # None in that case and the worker writes the response itself via
             # the transport we pass in (a separate thread, so transport.write
@@ -478,7 +485,9 @@ async def handle_ws(
                 continue
 
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await asyncio.to_thread(
+                    server.dispatch, req, transport, principal=principal
+                )
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

@@ -382,6 +382,11 @@ def _eager_reconcile_own_session_db() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
+    if _is_managed_staff_mode():
+        try:
+            _install_managed_staff_adapters()
+        except Exception as exc:
+            raise RuntimeError(f"managed staff startup failed closed: {exc}") from exc
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}  # dict[str, Path]
@@ -675,6 +680,191 @@ def _has_valid_session_token(request: Request) -> bool:
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
 _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
+
+_MANAGED_STAFF_EXPORT_ADAPTER = None
+_MANAGED_STAFF_IDENTITY_ADAPTER = None
+_MANAGED_STAFF_REQUIRED_IDENTITY = (
+    "subject",
+    "user_id",
+    "plane",
+    "instance_id",
+    "product_id",
+    "connection_id",
+    "profile_id",
+    "session_id",
+    "broker_namespace",
+)
+
+
+def _is_managed_staff_mode() -> bool:
+    return os.environ.get("HERMES_MANAGED_STAFF_MODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _install_managed_staff_adapters() -> None:
+    if not _is_managed_staff_mode():
+        return
+    from hermes_cli.managed_staff import (
+        ManagedStaffBrokerClient,
+        get_managed_staff_session,
+        load_managed_staff_config,
+        make_identity_resolver,
+    )
+
+    config = load_managed_staff_config()
+    broker = ManagedStaffBrokerClient(config)
+    base_resolver = make_identity_resolver(config)
+
+    def resolve_request(request: Request) -> dict[str, str]:
+        session = getattr(request.state, "session", None)
+        if session is None:
+            raise RuntimeError("verified managed staff session is unavailable")
+        if getattr(session, "user_id", "") != config["user_id"]:
+            raise RuntimeError("managed staff user binding mismatch")
+        if getattr(session, "provider", None) != config["oidc"]["provider"]:
+            raise RuntimeError("managed staff provider binding mismatch")
+        verified_subject = (
+            getattr(session, "subject", "")
+            or getattr(session, "oidc_subject", "")
+        )
+        if verified_subject != config["oidc"]["subject"]:
+            raise RuntimeError("managed staff subject binding mismatch")
+        session_expires_at = float(getattr(session, "expires_at", 0))
+        session_id = str(getattr(session, "session_id", "") or "").strip()
+        if not session_id:
+            raise RuntimeError("managed staff session id is unavailable")
+        dynamic = get_managed_staff_session(
+            config,
+            session_id=session_id,
+            profile_id="default",
+            session_expires_at=session_expires_at,
+        )
+        request.state.managed_staff_session = dynamic
+        return base_resolver(request)
+
+    configure_managed_staff_adapters(
+        export_adapter=broker,
+        identity_adapter=resolve_request,
+    )
+    app.state.staff_export_adapter = broker
+    app.state.staff_identity_adapter = resolve_request
+
+
+def configure_managed_staff_adapters(
+    *, export_adapter=None, identity_adapter=None
+) -> None:
+    """Install the supplied staff identity/export seams for this process."""
+    global _MANAGED_STAFF_EXPORT_ADAPTER, _MANAGED_STAFF_IDENTITY_ADAPTER
+    _MANAGED_STAFF_EXPORT_ADAPTER = export_adapter
+    _MANAGED_STAFF_IDENTITY_ADAPTER = identity_adapter
+
+
+def _staff_request_identity(request: Request) -> dict[str, str]:
+    resolver = _MANAGED_STAFF_IDENTITY_ADAPTER
+    if not callable(resolver):
+        raise HTTPException(status_code=503, detail="staff identity adapter unavailable")
+    try:
+        identity = resolver(request)
+    except Exception as exc:
+        _log.warning("Managed staff identity resolution failed: %s", exc)
+        raise HTTPException(status_code=403, detail="staff identity unavailable") from exc
+    if not isinstance(identity, dict):
+        try:
+            identity = {
+                key: getattr(identity, key)
+                for key in _MANAGED_STAFF_REQUIRED_IDENTITY
+            }
+        except AttributeError:
+            identity = None
+    if not isinstance(identity, dict):
+        raise HTTPException(status_code=403, detail="staff identity unavailable")
+    if set(identity) != set(_MANAGED_STAFF_REQUIRED_IDENTITY):
+        raise HTTPException(status_code=403, detail="staff identity has invalid fields")
+    if any(
+        not isinstance(identity.get(key), str) or not identity[key].strip()
+        for key in _MANAGED_STAFF_REQUIRED_IDENTITY
+    ):
+        raise HTTPException(status_code=403, detail="staff identity incomplete")
+    plane = identity["plane"].strip().lower()
+    product_id = identity["product_id"].strip()
+    expected_product = (
+        "uk.co.scopefurnishing.hermes.internal"
+        if plane == "internal"
+        else "uk.co.scopefurnishing.hermes.external"
+        if plane == "external"
+        else ""
+    )
+    if not expected_product or product_id != expected_product:
+        raise HTTPException(status_code=403, detail="staff identity invalid")
+    return {key: identity[key] for key in _MANAGED_STAFF_REQUIRED_IDENTITY}
+
+
+def _staff_export_response(request: Request, export_id: str) -> Response:
+    adapter = _MANAGED_STAFF_EXPORT_ADAPTER
+    if adapter is None:
+        raise HTTPException(
+            status_code=503, detail="staff export adapter unavailable"
+        )
+    method = getattr(adapter, "staff_download_export", None)
+    if not callable(method):
+        method = getattr(adapter, "download_export", None)
+    if not callable(method):
+        method = adapter if callable(adapter) else None
+    if method is None:
+        raise HTTPException(status_code=503, detail="staff export adapter invalid")
+
+    identity = _staff_request_identity(request)
+    try:
+        result = method(identity=identity, export_id=export_id)
+    except Exception as exc:
+        _log.warning("Managed staff export consume failed: %s", exc)
+        raise HTTPException(status_code=404, detail="staff export unavailable") from exc
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="invalid staff export")
+    if "path" in result or "file_path" in result:
+        raise HTTPException(status_code=502, detail="staff export returned a path")
+    data = result.get("data")
+    if not isinstance(data, (bytes, bytearray)):
+        raise HTTPException(status_code=502, detail="staff export has no bytes")
+    data = bytes(data)
+    returned_id = result.get("export_id")
+    if not isinstance(returned_id, str) or returned_id != export_id:
+        raise HTTPException(status_code=502, detail="staff export tuple mismatch")
+    state = result.get("state")
+    if not isinstance(state, str) or state.strip().lower() not in {"downloaded", "released"}:
+        raise HTTPException(status_code=403, detail="staff export is not released")
+    scan_state = result.get("scan_state")
+    if scan_state is not None and scan_state != "released":
+        raise HTTPException(status_code=403, detail="staff export is not released")
+    try:
+        expected_length = int(result["length"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="staff export length missing") from exc
+    if expected_length != len(data):
+        raise HTTPException(status_code=502, detail="staff export length mismatch")
+    digest = hashlib.sha256(data).hexdigest()
+    if result.get("sha256") != digest:
+        raise HTTPException(status_code=502, detail="staff export digest mismatch")
+    media_type = result.get("mime_type")
+    if not isinstance(media_type, str) or not media_type.strip() or "/" not in media_type:
+        raise HTTPException(status_code=502, detail="staff export MIME missing")
+    filename = result.get("filename")
+    if not isinstance(filename, str) or not filename.strip():
+        raise HTTPException(status_code=502, detail="staff export filename missing")
+    safe_filename = Path(filename).name
+    headers = {
+        "Content-Length": str(expected_length),
+        "X-Content-SHA256": digest,
+        "X-Hermes-Export-State": state.strip().lower(),
+        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+    }
+    return Response(content=data, media_type=media_type.strip().lower(), headers=headers)
+
+
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
@@ -2888,6 +3078,14 @@ async def stream_managed_file(request: Request, path: str):
         content_disposition_type="inline",
         media_only=True,
     )
+
+
+async def download_staff_export(request: Request, export_id: str):
+    """Download one released, authenticated, one-use staff export."""
+    if not re.fullmatch(r"exp_[A-Za-z0-9_-]{43}", export_id or ""):
+        raise HTTPException(status_code=404, detail="Export not found")
+    _require_token(request)
+    return _staff_export_response(request, export_id)
 
 
 @app.post("/api/files/upload")
@@ -16457,6 +16655,97 @@ def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     return (ticket, "ok") if ticket else ("", "invalid")
 
 
+def _set_ws_principal(ws: "WebSocket", principal: dict[str, Any]) -> None:
+    scope = getattr(ws, "scope", None)
+    if isinstance(scope, dict):
+        scope["_hermes_ws_principal"] = dict(principal)
+
+
+def _ws_principal(ws: "WebSocket") -> dict[str, Any] | None:
+    scope = getattr(ws, "scope", None)
+    value = scope.get("_hermes_ws_principal") if isinstance(scope, dict) else None
+    if not isinstance(value, dict):
+        return None
+    if any(
+        not isinstance(value.get(key), str) or not value[key].strip()
+        for key in ("user_id", "provider", "subject")
+    ):
+        return None
+    session_expires_at = value.get("session_expires_at")
+    if (
+        isinstance(session_expires_at, bool)
+        or not isinstance(session_expires_at, (int, float))
+        or session_expires_at <= time.time()
+        or value.get("revoked") is True
+    ):
+        return None
+    principal = {
+        "user_id": value["user_id"],
+        "provider": value["provider"],
+        "subject": value["subject"],
+        "session_expires_at": session_expires_at,
+    }
+    session_id = value.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        principal["session_id"] = session_id
+    access_token = value.get("_session_access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        principal["_session_access_token"] = access_token
+    return principal
+
+
+def _verify_ws_ticket_session(info: dict[str, Any]) -> dict[str, Any]:
+    from hermes_cli.dashboard_auth.ws_tickets import TicketInvalid
+    access_token = info.get("_access_token")
+    if not access_token:
+        return dict(info)
+
+    from hermes_cli.dashboard_auth import list_session_providers
+    from hermes_cli.dashboard_auth.base import ProviderError
+
+    expected_user_id = info.get("user_id")
+    expected_provider = info.get("provider")
+    expected_subject = info.get("subject")
+    expected_session_id = info.get("session_id")
+    expected_expires_at = float(info["session_expires_at"])
+    unreachable = False
+    for provider in list_session_providers():
+        try:
+            session = provider.verify_session(access_token=access_token)
+        except ProviderError:
+            unreachable = True
+            continue
+        if session is None:
+            continue
+        if (
+            session.provider != expected_provider
+            or session.user_id != expected_user_id
+            or (
+                expected_subject is not None
+                and getattr(session, "subject", "") != expected_subject
+            )
+            or (
+                expected_session_id is not None
+                and getattr(session, "session_id", "") != expected_session_id
+            )
+        ):
+            continue
+        verified_expires_at = getattr(session, "expires_at", None)
+        if (
+            isinstance(verified_expires_at, bool)
+            or not isinstance(verified_expires_at, (int, float))
+            or verified_expires_at <= time.time()
+        ):
+            continue
+        result = dict(info)
+        result["session_expires_at"] = min(
+            expected_expires_at, float(verified_expires_at)
+        )
+        result.pop("_access_token", None)
+        result["_session_access_token"] = access_token
+        return result
+    reason = "provider unavailable" if unreachable else "stale or revoked session"
+    raise TicketInvalid(f"authenticated session {reason}")
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
@@ -16507,11 +16796,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         if internal:
             try:
                 info = consume_internal_credential(internal)
-                # Stamp the server-minted identity onto the WS object so the
-                # connection (and any transport built from it) can never be
-                # impersonated by RPC params. Internal peers are marked
-                # ``server-internal`` and are excluded from privileged
-                # controller registration downstream.
+                _set_ws_principal(ws, info)
+                # The browser-controller identity is server-minted and cannot
+                # be supplied or spoofed through RPC params.
                 ws._hermes_auth_identity = {
                     "user_id": info.get("user_id"),
                     "provider": info.get("provider"),
@@ -16534,22 +16821,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            info = consume_ticket(ticket)
-            # The ticket binds a server-minted {user_id, provider}; stamp it
-            # onto the WS object so ``gateway_ws`` can hand it to the gateway
-            # transport, where it is the sole identity authority for
-            # browser-controller registration. A client can never supply or
-            # spoof this value through RPC params. Only the two identity
-            # fields are carried — bookkeeping (e.g. ``minted_at``) is not
-            # part of the identity contract.
+            info = _verify_ws_ticket_session(consume_ticket(ticket))
+            _set_ws_principal(ws, info)
+            # Carry only the server-minted public identity into the gateway
+            # controller boundary; RPC params never become identity authority.
             ws._hermes_auth_identity = {
                 "user_id": info.get("user_id"),
                 "provider": info.get("provider"),
             }
             if protocol_ticket:
                 # Select only the stable public protocol during accept. The
-                # ticket-bearing protocol is a credential and must never be
-                # reflected back to the browser or retained after admission.
+                # credential-bearing protocol is never reflected or retained.
                 ws._hermes_ws_subprotocol = _GATEWAY_WS_PROTOCOL
                 return None, "ticket-subprotocol"
             return None, "ticket"
@@ -17685,7 +17967,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, cred = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -17693,15 +17976,17 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    principal = _ws_principal(ws)
+    if _is_managed_staff_mode() and principal is None:
+        await ws.close(code=4403)
+        return
+
     from tui_gateway.ws import handle_ws
 
-    # The authenticated identity (ticket / internal credential) was stamped
-    # onto the WS object by _ws_auth_reason; carry it into the gateway
-    # transport where it becomes the identity authority for privileged RPCs
-    # (browser.controller.register). None on the legacy token path.
     await handle_ws(
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
+        principal=principal,
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 
@@ -19153,6 +19438,8 @@ def _mount_plugin_api_routes():
     execution vector that bypasses the user's intent. (#46435,
     GHSA-mcfc-hp25-cjv7)
     """
+    if _is_managed_staff_mode():
+        return
     # Load the enabled/disabled sets once for the loop.
     try:
         from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
@@ -19206,10 +19493,6 @@ def _mount_plugin_api_routes():
             resolved_base = dashboard_dir.resolve()
             resolved_api.relative_to(resolved_base)
         except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
             _log.warning(
                 "Plugin %s: refusing to import api file outside its "
                 "dashboard directory (%s)", plugin["name"], api_path,
@@ -19224,12 +19507,6 @@ def _mount_plugin_api_routes():
             if spec is None or spec.loader is None:
                 continue
             mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
             sys.modules[module_name] = mod
             try:
                 spec.loader.exec_module(mod)
@@ -19246,17 +19523,49 @@ def _mount_plugin_api_routes():
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
 
 
-# Mount plugin API routes before the SPA catch-all.
+def _install_managed_staff_routes() -> None:
+    if not _is_managed_staff_mode():
+        return
+    app.add_api_route(
+        "/v1/exports/{export_id}/download",
+        download_staff_export,
+        methods=["GET"],
+        name="staff_export_download",
+        include_in_schema=False,
+    )
+    allowed = {
+        "/api/health",
+        "/api/status",
+        "/api/ws",
+        "/login",
+        "/v1/exports/{export_id}/download",
+    }
+
+    def allowed_core_route(route: Any) -> bool:
+        path = getattr(route, "path", "")
+        return (
+            path in allowed
+            or path.startswith("/api/auth/")
+            or path.startswith("/auth/")
+            or path == "/api/sessions"
+            or path.startswith("/api/sessions/")
+        )
+
+    app.router.routes = [route for route in app.router.routes if allowed_core_route(route)]
+
+
+# Mount plugin routes before the SPA catch-all.
 _mount_plugin_api_routes()
 
 # Mount the dashboard auth routes (/login, /auth/*, /api/auth/*) before the
 # SPA catch-all so /{full_path:path} doesn't swallow them.  These are
-# always mounted — the gate middleware decides whether to enforce auth,
-# not whether the routes exist.
+# always mounted — the gate decides whether the routes exist.
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
 
-mount_spa(app)
+_install_managed_staff_routes()
+if not _is_managed_staff_mode():
+    mount_spa(app)
 
 
 def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
@@ -19553,6 +19862,31 @@ def _report_port_in_use(host: str, port: int) -> None:
         flush=True,
     )
 
+def _validate_managed_staff_auth() -> None:
+    from hermes_cli.dashboard_auth import list_providers
+    from hermes_cli.managed_staff import (
+        load_managed_staff_config,
+        managed_staff_provider_matches,
+    )
+
+    all_providers = list_providers()
+    if any(
+        provider.name == "basic"
+        or bool(getattr(provider, "supports_password", False))
+        for provider in all_providers
+    ):
+        raise SystemExit("Basic Auth is not permitted in managed staff mode")
+    oidc = load_managed_staff_config()["oidc"]
+    providers = [
+        provider
+        for provider in all_providers
+        if managed_staff_provider_matches(provider, oidc)
+    ]
+    if len(providers) != 1:
+        raise SystemExit(
+            "Managed staff dashboard requires exactly one configured OIDC provider "
+            "bound to the immutable deployment"
+        )
 
 def start_server(
     host: str = "127.0.0.1",
@@ -19598,19 +19932,20 @@ def start_server(
     except Exception as exc:
         _log.debug("Nous auth keepalive did not start: %s", exc)
 
+    managed_staff = _is_managed_staff_mode()
+    if managed_staff:
+        try:
+            _install_managed_staff_adapters()
+        except Exception as exc:
+            raise SystemExit(f"Managed staff startup failed closed: {exc}") from exc
+        _validate_managed_staff_auth()
+
     # A configured browser-facing URL is also the exact Host/Origin trust
-    # declaration for reverse-proxy deployments. Resolve it once at startup so
-    # request middleware never reloads config. Any non-loopback public hostname
-    # engages the auth gate even when the backend itself remains on loopback;
-    # otherwise the SPA's local session token would become remotely reachable.
+    # declaration for reverse-proxy deployments. Resolve it once at startup.
     app.state.trusted_public_hosts = _dashboard_public_hosts()
-    # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
-    # WS-auth paths can branch on it consistently. It also decides whether to
-    # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_dashboard_auth(
+    app.state.auth_required = managed_staff or should_require_dashboard_auth(
         host, app.state.trusted_public_hosts
     )
-
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
     # dashboards). If a caller still passes it, warn that it is now a no-op

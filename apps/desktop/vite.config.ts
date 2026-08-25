@@ -62,6 +62,63 @@ const debugEntry = (command: string, env: Record<string, string>) =>
   command === 'serve' || env.VITE_PERF_PROBE === '1'
     ? path.resolve(__dirname, './src/debug/dev-only.ts')
     : path.resolve(__dirname, './src/debug/dev-only.noop.ts')
+export const managedBuildDefines = (env: Record<string, string | undefined>) => {
+  const plane = env.HERMES_DESKTOP_BUILD_PRODUCT?.trim() || ''
+  const hasManagedInputs = Object.keys(env).some(key => key.startsWith('HERMES_DESKTOP_MANAGED_'))
+
+  if (!plane) {
+    if (hasManagedInputs) {
+      throw new Error('Managed build inputs require HERMES_DESKTOP_BUILD_PRODUCT=internal|external.')
+    }
+
+    return {
+      __HERMES_DESKTOP_BUILD_PRODUCT__: JSON.stringify(null),
+      __HERMES_DESKTOP_MANAGED_ORIGIN__: JSON.stringify(null),
+      __HERMES_DESKTOP_MANAGED_OIDC_ISSUER__: JSON.stringify(null),
+      __HERMES_DESKTOP_MANAGED_OIDC_AUDIENCE__: JSON.stringify(null),
+      __HERMES_DESKTOP_MANAGED_OIDC_REDIRECT_URI__: JSON.stringify(null)
+    }
+  }
+
+  if (plane !== 'internal' && plane !== 'external') {
+    throw new Error('HERMES_DESKTOP_BUILD_PRODUCT must be internal or external.')
+  }
+
+  const required = {
+    origin: env.HERMES_DESKTOP_MANAGED_ORIGIN?.trim(),
+    issuer: env.HERMES_DESKTOP_MANAGED_OIDC_ISSUER?.trim(),
+    audience: env.HERMES_DESKTOP_MANAGED_OIDC_AUDIENCE?.trim(),
+    redirectUri: env.HERMES_DESKTOP_MANAGED_OIDC_REDIRECT_URI?.trim()
+  }
+
+  if (Object.values(required).some(value => !value)) {
+    throw new Error('Managed builds require origin and OIDC issuer/audience/redirect inputs.')
+  }
+
+  for (const [name, value] of Object.entries(required)) {
+    if (name === 'audience') {
+      continue
+    }
+
+    const parsed = new URL(value!)
+    const hostname = parsed.hostname.toLowerCase()
+
+    if (hostname === 'localhost' || hostname === '[::1]' || hostname.startsWith('127.')) {
+      throw new Error(`Managed ${name} cannot use a loopback host.`)
+    }
+
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash || parsed.search) {
+      throw new Error(`Managed ${name} must be an HTTPS URL without credentials, query, or fragment.`)
+    }
+  }
+  return {
+    __HERMES_DESKTOP_BUILD_PRODUCT__: JSON.stringify(plane),
+    __HERMES_DESKTOP_MANAGED_ORIGIN__: JSON.stringify(required.origin),
+    __HERMES_DESKTOP_MANAGED_OIDC_ISSUER__: JSON.stringify(required.issuer),
+    __HERMES_DESKTOP_MANAGED_OIDC_AUDIENCE__: JSON.stringify(required.audience),
+    __HERMES_DESKTOP_MANAGED_OIDC_REDIRECT_URI__: JSON.stringify(required.redirectUri)
+  }
+}
 
 // The emoji picker (frimousse) fetches `<emojibaseUrl>/<locale>/data.json` at
 // runtime. Its default is a CDN; Electron must work offline, so serve the
@@ -103,6 +160,7 @@ const emojibaseAssets = () => ({
 
 export default defineConfig(({ command }) => ({
   base: './',
+  define: managedBuildDefines(process.env as Record<string, string | undefined>),
   plugins: [react(), babel({ presets: [compilerPreset()] }), tailwindcss(), emojibaseAssets()],
   css: {
     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by
@@ -119,7 +177,6 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     // The renderer intentionally ships FEW chunks (not one, not thousands):
-    //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /
     //     dynamic import into the entry, so heavyweight lazy-only deps
     //     (mermaid, shiki grammars, katex) are parsed + evaluated on every
     //     cold start even though nothing rendered them. By the time the

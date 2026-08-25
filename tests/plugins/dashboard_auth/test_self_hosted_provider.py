@@ -653,6 +653,29 @@ class TestPluginRegister:
         assert oidc_plugin.LAST_SKIP_REASON == ""
 
 
+    def test_managed_registration_binds_static_redirect(self, monkeypatch):
+        managed = {
+            "user_id": "staff-user",
+            "oidc": {
+                "provider": "entra",
+                "issuer": "https://login.example.test",
+                "client_id": "managed-client",
+                "audience": "api://hermes",
+                "subject": "managed-subject",
+                "redirect_uri": "https://hermes.example.test/auth/callback",
+            },
+        }
+        monkeypatch.setenv("HERMES_MANAGED_STAFF_MODE", "1")
+        monkeypatch.setattr(
+            "hermes_cli.managed_staff.load_managed_staff_config",
+            lambda: managed,
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered.redirect_uri == managed["oidc"]["redirect_uri"]
+
+
     def test_env_overrides_config(self, patch_config, monkeypatch):
         patch_config(
             {

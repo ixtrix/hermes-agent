@@ -18,6 +18,7 @@
  *     this via the public `/api/status` field `auth_required: true`.
  */
 
+import { managedProductPolicy as BUILD_MANAGED_PRODUCT_POLICY, MANAGED_PRODUCT_IDS } from './managed-product'
 // Bare + prefixed variants of the session cookies the gateway may set,
 // depending on its deploy shape (HTTPS direct → __Host-, behind a path prefix
 // → __Secure-, loopback HTTP → bare). Mirrors
@@ -62,6 +63,31 @@ const PRIVY_ACCESS_COOKIE_VARIANTS = ['__Host-privy-token', '__Secure-privy-toke
 // Keep this aligned with hermes_cli.profiles.validate_profile_name(). `default`
 // is the built-in root alias; these names cannot be created as profiles.
 const RESERVED_REMOTE_PROFILES = new Set(['hermes', 'test', 'tmp', 'root', 'sudo'])
+
+function resolveManagedProductPolicy() {
+  return BUILD_MANAGED_PRODUCT_POLICY
+}
+
+function managedProductIdForPlane(plane) {
+  return MANAGED_PRODUCT_IDS[plane] || null
+}
+
+function managedConnectionMatches(policy, candidate) {
+  if (!policy || !candidate || typeof candidate !== 'object') {
+    return false
+  }
+
+  try {
+    return (
+      candidate.productId === policy.productId &&
+      candidate.plane === policy.plane &&
+      normalizeRemoteBaseUrl(candidate.origin || candidate.remoteUrl) === policy.origin
+    )
+  } catch {
+    return false
+  }
+}
+
 
 function normalizeRemoteBaseUrl(rawUrl) {
   let value = String(rawUrl || '').trim()
@@ -1016,6 +1042,9 @@ export {
   hostLabelFromBaseUrl,
   isGatewayAuthRejection,
   localProfileEntry,
+  MANAGED_PRODUCT_IDS,
+  managedConnectionMatches,
+  managedProductIdForPlane,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
   normalizeRemoteHeaders,
@@ -1031,6 +1060,7 @@ export {
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
+  resolveManagedProductPolicy,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
   resolveRemoteSshDashboardProfile,

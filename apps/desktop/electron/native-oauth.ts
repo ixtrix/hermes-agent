@@ -118,7 +118,13 @@ export function resolveLoginStrategy(
  */
 export function buildNativeAuthorizeUrl(
   baseUrl: string,
-  params: { challenge: string; redirectUri: string; state: string; provider?: string }
+  params: {
+    challenge: string
+    redirectUri: string
+    state: string
+    provider?: string
+    oidc?: { audience: string; issuer: string; redirectUri: string }
+  }
 ): string {
   const parsed = new URL(baseUrl)
   const prefix = parsed.pathname.replace(/\/+$/, '')
@@ -132,6 +138,11 @@ export function buildNativeAuthorizeUrl(
 
   if (params.provider) {
     q.set('provider', params.provider)
+  }
+  if (params.oidc) {
+    q.set('oidc_issuer', params.oidc.issuer)
+    q.set('oidc_audience', params.oidc.audience)
+    q.set('oidc_redirect_uri', params.oidc.redirectUri)
   }
 
   return `${parsed.protocol}//${parsed.host}${prefix}/auth/native/authorize?${q.toString()}`

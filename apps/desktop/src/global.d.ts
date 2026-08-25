@@ -227,6 +227,12 @@ declare global {
         } | null
       } | null>
       readFileDataUrl: (filePath: string) => Promise<string>
+      /** Managed builds: picker-selected bytes; no filesystem path crosses the bridge. */
+      pickAttachmentBytes?: (
+        options?: HermesAttachmentPickerOptions
+      ) => Promise<ManagedPickedAttachment[]>
+      /** Managed builds: save one opaque released export through authenticated main-process IPC. */
+      saveExport?: (exportId: string, suggestedName?: string) => Promise<ManagedExportSaveResult>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>
       /** Settings → Chat: max size for local files loaded as data URLs (attach/preview). */
@@ -1397,6 +1403,34 @@ export interface HermesSelectPathsOptions {
   profile?: string
   filters?: Array<{ name: string; extensions: string[] }>
 }
+
+export type ManagedAttachmentPurpose = 'document' | 'media' | 'supplier'
+
+export interface ManagedSupplierMetadata {
+  supplier_domain: string
+  supplier_id: string
+}
+
+export interface HermesAttachmentPickerOptions {
+  filters?: Array<{ name: string; extensions: string[] }>
+  multiple?: boolean
+  purpose: ManagedAttachmentPurpose
+  supplier?: ManagedSupplierMetadata
+  title?: string
+}
+
+export interface ManagedPickedAttachment {
+  bytes: Uint8Array
+  mime: string
+  name: string
+  purpose: ManagedAttachmentPurpose
+  size: number
+  supplier?: ManagedSupplierMetadata
+}
+
+export type ManagedExportSaveResult =
+  | { filePath: string; ok: true }
+  | { canceled: true; ok: false }
 
 export interface BackendExit {
   code: number | null

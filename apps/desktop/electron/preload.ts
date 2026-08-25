@@ -11,7 +11,11 @@ const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 
-contextBridge.exposeInMainWorld('hermesDesktop', {
+import { isManagedProductBuild } from './managed-product'
+
+const MANAGED_PRODUCT_BUILD = isManagedProductBuild
+
+const ordinaryDesktopBridge = {
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
@@ -517,4 +521,27 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:open-find-bar', listener)
   }
-})
+}
+
+const managedDesktopBridge = {
+  api: request => ipcRenderer.invoke('hermes:api', request),
+  getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
+  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+  getConnectionConfig: () => ipcRenderer.invoke('hermes:connection-config:get'),
+  oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
+  oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
+  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  notify: payload => ipcRenderer.invoke('hermes:notify', payload),
+  pickAttachmentBytes: options => ipcRenderer.invoke('hermes:pickAttachmentBytes', options),
+  profile: {
+    get: () => ipcRenderer.invoke('hermes:profile:get')
+  },
+  saveExport: (exportId, suggestedName) =>
+    ipcRenderer.invoke('hermes:managed:export-save', exportId, suggestedName)
+}
+
+contextBridge.exposeInMainWorld(
+  'hermesDesktop',
+  MANAGED_PRODUCT_BUILD ? managedDesktopBridge : ordinaryDesktopBridge
+)

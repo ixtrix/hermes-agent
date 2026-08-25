@@ -184,19 +184,47 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        provider_name: str | None = None,
+        audience: str | None = None,
+        subject: str | None = None,
+        business_user_id: str | None = None,
+        redirect_uri: str | None = None,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
         if not client_id:
             raise ValueError("client_id is required")
-        # ``issuer`` is the OIDC issuer identifier. Normalise the trailing
-        # slash for stable string compares (the ``iss`` claim must match the
-        # issuer the IDP advertises in discovery — we pin against the
-        # discovered value, not this normalised one, to be tolerant of a
-        # trailing-slash mismatch between config and the IDP).
-        self._issuer = issuer.rstrip("/")
-        _require_https_or_loopback(self._issuer, field="issuer")
-        self._client_id = client_id
+        provider_name = (provider_name or self.name).strip()
+        audience = (audience or client_id).strip()
+        if not provider_name:
+            raise ValueError("provider name is required")
+        if not audience:
+            raise ValueError("audience is required")
+        if subject is not None and not subject.strip():
+            raise ValueError("subject must not be empty")
+        if business_user_id is not None and not business_user_id.strip():
+            raise ValueError("business_user_id must not be empty")
+        if redirect_uri is not None and not redirect_uri.strip():
+            raise ValueError("redirect_uri must not be empty")
+        # Keep these bindings public: the managed gate compares this one
+        # provider instance with the root-resolved managed config.
+        self.name = provider_name
+        self.issuer = issuer.rstrip("/")
+        self.client_id = client_id
+        self.audience = audience
+        self.subject = subject.strip() if subject is not None else None
+        self.business_user_id = (
+            business_user_id.strip() if business_user_id is not None else None
+        )
+        self.redirect_uri = (
+            redirect_uri.strip() if redirect_uri is not None else None
+        )
+        _require_https_or_loopback(self.issuer, field="issuer")
+        if self.redirect_uri is not None:
+            _require_https_or_loopback(self.redirect_uri, field="redirect_uri")
+        self._issuer = self.issuer
+        self._client_id = self.client_id
+        self._audience = self.audience
         self._scopes = scopes.strip() or _DEFAULT_SCOPES
         # An empty/whitespace secret means "public client" — strip so a
         # provisioned-but-blank secret can't flip us into a broken confidential
@@ -204,8 +232,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         self._client_secret = (client_secret or "").strip()
 
         # Discovery + JWKS are lazily resolved on first use so plugin
-        # registration never makes a network call (the IDP may be down at
-        # boot; the gate should still come up and fail per-request).
+        # registration never makes a network call.
         self._discovery: Dict[str, Any] | None = None
         self._discovery_fetched_at: float = 0.0
         self._discovery_lock = threading.Lock()
@@ -627,7 +654,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 id_token,
                 signing_key.key,
                 algorithms=list(_ALLOWED_ID_TOKEN_ALGS),
-                audience=self._client_id,
+                audience=self._audience,
                 issuer=disco["issuer"],
                 options={"require": ["exp", "iat", "aud", "iss", "sub"]},
             )
@@ -649,7 +676,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                     f" [token iss={unverified.get('iss')!r} "
                     f"aud={unverified.get('aud')!r}; "
                     f"expected iss={disco['issuer']!r} "
-                    f"aud={self._client_id!r}]"
+                    f"aud={self._audience!r}]"
                 )
             except Exception:
                 pass
@@ -657,7 +684,18 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 f"ID token verification failed: {exc}{details}"
             ) from exc
 
+        self._validate_verified_subject(claims)
         return claims
+
+    def _validate_verified_subject(self, claims: Dict[str, Any]) -> str:
+        """Return the verified OIDC subject and enforce managed pinning."""
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject.strip():
+            raise ProviderError("ID token missing a non-empty 'sub' claim")
+        subject = subject.strip()
+        if self.subject is not None and subject != self.subject:
+            raise ProviderError("ID token subject does not match managed binding")
+        return subject
 
     # ---- internals: mapping + misc ----------------------------------------
 
@@ -668,19 +706,10 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         refresh_token: str,
         claims: Dict[str, Any],
     ) -> Session:
-        """Map verified OIDC claims onto a Session.
-
-        The verified ID token is stored in ``Session.access_token`` so the
-        per-request ``verify_session`` re-verifies a real JWT. The opaque
-        OAuth access token is intentionally NOT stored — Hermes does not call
-        any resource API with it; the dashboard only needs identity.
-        """
-        user_id = str(claims.get("sub", ""))
-        if not user_id:
-            raise ProviderError("ID token missing 'sub' (user_id) claim")
-
+        """Map verified OIDC claims onto a Session."""
+        subject = self._validate_verified_subject(claims)
+        user_id = self.business_user_id or subject
         email = str(claims.get("email", "") or "")
-        # Standard OIDC display claims, in preference order.
         display_name = str(
             claims.get("name")
             or claims.get("preferred_username")
@@ -688,25 +717,22 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             or email
             or ""
         )
-        # Org/tenant is non-standard; accept the common spellings. Groups, if
-        # present as a list, are joined so multi-tenant IDPs surface *something*
-        # rather than dropping the info — org_id is a free-form string.
         org_id = claims.get("org_id") or claims.get("organization") or ""
         if not org_id:
             groups = claims.get("groups")
             if isinstance(groups, list) and groups:
                 org_id = ",".join(str(g) for g in groups)
-        org_id = str(org_id or "")
-
         return Session(
             user_id=user_id,
             email=email,
             display_name=display_name,
-            org_id=org_id,
+            org_id=str(org_id or ""),
             provider=self.name,
             expires_at=int(claims["exp"]),
             access_token=id_token,
             refresh_token=refresh_token,
+            subject=subject,
+            session_id="oidc_" + hashlib.sha256(id_token.encode("utf-8")).hexdigest(),
         )
 
     def _validate_redirect_uri(self, redirect_uri: str) -> None:
@@ -789,39 +815,69 @@ def _resolve_setting(env_var: str, cfg_value: Any) -> str:
 
 
 def register(ctx) -> None:
-    """Plugin entry — called by the plugin loader at startup.
+    """Register the single configured OIDC authority.
 
-    Registers :class:`SelfHostedOIDCProvider` only when both an issuer and a
-    client_id are configured (via ``HERMES_DASHBOARD_OIDC_*`` env vars or the
-    ``dashboard.oauth.self_hosted`` block in config.yaml). Operator-owned
-    loopback / ``--insecure`` dashboards leave these unset, so the plugin is a
-    no-op for them.
-
-    On skip, writes a reason to :data:`LAST_SKIP_REASON` that names BOTH
-    configuration surfaces so operators don't guess wrong about which to set.
+    Managed staff mode reads issuer, client, audience, provider, subject, and
+    business-user mapping from the root-owned managed config. Ordinary
+    dashboards retain the existing env/config-driven self-hosted provider.
+    Managed configuration errors fail closed rather than falling back to a
+    second verifier or caller-supplied identity.
     """
     global LAST_SKIP_REASON
     LAST_SKIP_REASON = ""
 
-    oauth_section = _load_config_oauth_section()
-    oidc_cfg = _oidc_subsection(oauth_section)
+    managed_mode = os.environ.get("HERMES_MANAGED_STAFF_MODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    managed_config: dict[str, Any] | None = None
+    managed_oidc: dict[str, str] | None = None
+    if managed_mode:
+        try:
+            from hermes_cli.managed_staff import load_managed_staff_config
 
-    issuer = _resolve_setting(
-        "HERMES_DASHBOARD_OIDC_ISSUER", oidc_cfg.get("issuer")
-    )
-    client_id = _resolve_setting(
-        "HERMES_DASHBOARD_OIDC_CLIENT_ID", oidc_cfg.get("client_id")
-    )
-    scopes = (
-        _resolve_setting("HERMES_DASHBOARD_OIDC_SCOPES", oidc_cfg.get("scopes"))
-        or _DEFAULT_SCOPES
-    )
-    # Optional — set only for a confidential client. A credential, so the
-    # canonical home is the env var / ~/.hermes/.env; config.yaml is supported
-    # for precedence symmetry. Empty ⇒ public client (unchanged behaviour).
-    client_secret = _resolve_setting(
-        "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
-    )
+            loaded_config = load_managed_staff_config()
+            managed_config = loaded_config
+            managed_oidc = loaded_config["oidc"]
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            LAST_SKIP_REASON = f"managed OIDC configuration unavailable: {exc}"
+            logger.warning("dashboard-auth-self-hosted: %s", LAST_SKIP_REASON)
+            return
+
+    oauth_section = _load_config_oauth_section() if not managed_mode else {}
+    oidc_cfg = _oidc_subsection(oauth_section)
+    if managed_oidc is not None and managed_config is not None:
+        managed = managed_config
+        issuer = managed_oidc["issuer"]
+        client_id = managed_oidc["client_id"]
+        provider_name = managed_oidc["provider"]
+        audience = managed_oidc["audience"]
+        subject = managed_oidc["subject"]
+        business_user_id = managed["user_id"]
+        redirect_uri = managed_oidc["redirect_uri"]
+        scopes = _DEFAULT_SCOPES
+        client_secret = ""
+    else:
+        issuer = _resolve_setting(
+            "HERMES_DASHBOARD_OIDC_ISSUER", oidc_cfg.get("issuer")
+        )
+        client_id = _resolve_setting(
+            "HERMES_DASHBOARD_OIDC_CLIENT_ID", oidc_cfg.get("client_id")
+        )
+        provider_name = None
+        audience = None
+        subject = None
+        business_user_id = None
+        redirect_uri = None
+        scopes = (
+            _resolve_setting("HERMES_DASHBOARD_OIDC_SCOPES", oidc_cfg.get("scopes"))
+            or _DEFAULT_SCOPES
+        )
+        client_secret = _resolve_setting(
+            "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
+        )
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,11 +898,14 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            provider_name=provider_name,
+            audience=audience,
+            subject=subject,
+            business_user_id=business_user_id,
+            redirect_uri=redirect_uri,
         )
     except (ValueError, ProviderError) as exc:
-        LAST_SKIP_REASON = (
-            f"SelfHostedOIDCProvider construction failed: {exc}"
-        )
+        LAST_SKIP_REASON = f"SelfHostedOIDCProvider construction failed: {exc}"
         logger.warning("dashboard-auth-self-hosted: %s", LAST_SKIP_REASON)
         return
 

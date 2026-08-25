@@ -10,6 +10,7 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
@@ -17,6 +18,7 @@ import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
   type ComposerAttachment,
+  type ManagedAttachmentReceipt,
   patchMainComposerAttachmentOccurrence,
   setComposerAttachmentUploadState,
   updateComposerAttachment
@@ -71,7 +73,9 @@ import {
 import { useSlashCommand } from './slash'
 import { useSubmitPrompt } from './submit'
 import {
+  base64FromBytes,
   blobToDataUrl,
+  dataUrlFromBytes,
   delay,
   friendlyRemoteAttachError,
   type GatewayRequest,
@@ -79,6 +83,7 @@ import {
   markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  type RemoteImageAttachPayload,
   shouldInterruptBeforeRewind,
   type SubmitTextOptions,
   withSessionNotFoundResume
@@ -137,14 +142,114 @@ export async function uploadComposerAttachment(
   const { backendCwd, remote, requestGateway, storedSessionId, onSessionRecovered, terminalBackend } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
-  const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
 
-  // Read bytes/paths ONCE, outside the retry. Only the session-scoped RPC is
-  // replayed on recovery — re-reading a multi-MB file to retry a dead session
-  // id would double the disk/IPC cost of every recovered attach. For images,
-  // the chip's previewUrl already holds the full file as a base64 data URL,
-  // so passing it avoids re-reading the same bytes off disk at submit.
-  let imagePayload: Awaited<ReturnType<typeof readImageForRemoteAttach>> | null = null
+  const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
+  if (isManagedProductBuild) {
+    const bytes = attachment.bytes
+
+    if (!bytes || attachment.path || attachment.refText) {
+      throw new Error(`Managed attachments must contain picker bytes only: ${label}`)
+    }
+
+    const purpose = attachment.purpose
+    const supplier = attachment.supplierMetadata
+
+    if (
+      !purpose ||
+      (attachment.kind === 'image' && purpose !== 'media') ||
+      (attachment.kind === 'file' && purpose === 'media') ||
+      (purpose === 'supplier' &&
+        (!supplier?.supplier_id.trim() || !supplier?.supplier_domain.trim())) ||
+      (purpose !== 'supplier' && supplier)
+    ) {
+      throw new Error(`Managed attachment purpose is invalid for ${label}`)
+    }
+
+    const mime = attachment.mime || (attachment.kind === 'image' ? 'image/png' : 'application/octet-stream')
+    const size = bytes.byteLength
+    const rawResult = await requestGateway<{
+      attached?: boolean
+      attachment_id?: unknown
+      declared_mime?: string
+      detected_mime?: string
+      message?: string
+      metadata?: Record<string, string | number>
+      mime?: string
+      mime_type?: string
+      name?: string
+      purpose?: unknown
+      size?: number
+      size_bytes?: number
+      supplier?: { supplier_domain?: unknown; supplier_id?: unknown }
+      supplier_domain?: unknown
+      supplier_id?: unknown
+    }>(attachment.kind === 'image' ? 'image.attach_bytes' : 'file.attach', {
+      session_id: sessionId,
+      ...(attachment.kind === 'image'
+        ? {
+            content_base64: base64FromBytes(bytes),
+            filename: label,
+            mime,
+            mime_type: mime,
+            size
+          }
+        : {
+            data_url: dataUrlFromBytes(bytes, mime),
+            name: label,
+            mime,
+            mime_type: mime,
+            size
+          }),
+      purpose,
+      ...(supplier ? supplier : {})
+    })
+
+    const attachmentId = typeof rawResult.attachment_id === 'string' ? rawResult.attachment_id.trim() : ''
+    const responseSupplier =
+      rawResult.supplier && typeof rawResult.supplier === 'object' ? rawResult.supplier : undefined
+    const responseSupplierId =
+      rawResult.supplier_id ?? responseSupplier?.supplier_id ?? rawResult.metadata?.supplier_id
+    const responseSupplierDomain =
+      rawResult.supplier_domain ?? responseSupplier?.supplier_domain ?? rawResult.metadata?.supplier_domain
+    const responseHasSupplier =
+      responseSupplier !== undefined || responseSupplierId !== undefined || responseSupplierDomain !== undefined
+    const responsePurpose = rawResult.purpose ?? rawResult.metadata?.purpose
+
+    const responseSize = Number(rawResult.size ?? rawResult.size_bytes ?? size)
+    if (
+      rawResult.attached !== true ||
+      !attachmentId ||
+      responsePurpose !== purpose ||
+      !Number.isSafeInteger(responseSize) ||
+      responseSize !== size ||
+      (supplier
+        ? responseSupplierId !== supplier.supplier_id || responseSupplierDomain !== supplier.supplier_domain
+        : responseHasSupplier)
+    ) {
+      throw new Error(rawResult.message || `Could not attach ${label}`)
+    }
+
+    const receipt: ManagedAttachmentReceipt = {
+      attached: true,
+      attachment_id: attachmentId,
+      metadata: rawResult.metadata,
+      mime: rawResult.mime_type || rawResult.mime || rawResult.detected_mime || rawResult.declared_mime || mime,
+      name: rawResult.name || label,
+      purpose,
+      size: responseSize,
+      ...(supplier ? { supplier } : {})
+    }
+
+    return {
+      ...attachment,
+      attachedSessionId: sessionId,
+      receipt,
+      uploadState: undefined
+    }
+  }
+
+  // Read bytes once outside retry; only the session-scoped admission RPC is replayed.
+  let imagePayload: RemoteImageAttachPayload | null = null
   let fileDataUrl: null | string = null
 
   if (uploadBytes) {
@@ -301,6 +406,11 @@ export function usePromptActions({
       }
 
       const messageId = `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const message: ChatMessage = {
+        id: messageId,
+        role,
+        parts: [textPart(body)]
+      }
 
       updateSessionState(
         sessionId,

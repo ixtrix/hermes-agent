@@ -1,7 +1,19 @@
 import { atom } from 'nanostores'
 
+import type { ManagedAttachmentPurpose, ManagedSupplierMetadata } from '@/global'
 import { deriveDraftTitle } from '@/lib/draft-title'
 import { triggerHaptic } from '@/lib/haptics'
+
+export interface ManagedAttachmentReceipt {
+  attached: true
+  attachment_id: string
+  metadata?: Record<string, string | number>
+  mime: string
+  name: string
+  purpose: ManagedAttachmentPurpose
+  size: number
+  supplier?: ManagedSupplierMetadata
+}
 
 export interface ComposerAttachment {
   id: string
@@ -19,6 +31,12 @@ export interface ComposerAttachment {
   /** Downscaled data URL for the attachment card and optimistic bubble only. */
   thumbnailUrl?: string
   path?: string
+  bytes?: Uint8Array
+  mime?: string
+  size?: number
+  purpose?: ManagedAttachmentPurpose
+  supplierMetadata?: ManagedSupplierMetadata
+  receipt?: ManagedAttachmentReceipt
   attachedSessionId?: string
   /** Set while the file/image bytes are being staged into the session
    * workspace (remote upload or local stage), and 'error' if that failed.
