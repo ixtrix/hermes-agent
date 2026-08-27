@@ -898,7 +898,7 @@ def browser_exec(
     except (RuntimeError, ValueError) as exc:
         return tool_error(str(exc))
 
-    if probe.adapter == "staff-uds":
+    if probe.adapter == "staff-uds" and outcome.status == "ok":
         from hermes_cli.managed_browser import (
             consume_browser_activity,
             record_browser_activity,
