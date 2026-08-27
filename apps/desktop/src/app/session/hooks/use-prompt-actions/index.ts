@@ -139,7 +139,7 @@ export async function uploadComposerAttachment(
     terminalBackend?: string
   }
 ): Promise<ComposerAttachment> {
-  const { backendCwd, remote, requestGateway, storedSessionId, onSessionRecovered, terminalBackend } = opts
+  const { backendCwd, remote, requestGateway, sessionId, storedSessionId, onSessionRecovered, terminalBackend } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
 
@@ -478,12 +478,18 @@ export function usePromptActions({
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
 
-        // Already-synced or pathless refs (terminal, url, etc.) pass through.
-        // A drop-time eager upload may already have staged this one (matching
-        // attachedSessionId) — don't re-upload it. Compare against the LIVE id:
-        // after a mid-loop recovery an earlier chip's attachedSessionId points
-        // at the dead runtime and must be re-staged.
-        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
+        const managedAttachable =
+          isManagedProductBuild &&
+          (attachment.kind === 'image' || attachment.kind === 'file') &&
+          Boolean(attachment.bytes)
+        const alreadyAttached =
+          attachment.attachedSessionId === liveSessionId &&
+          (!isManagedProductBuild || Boolean(attachment.receipt))
+
+        // Managed picker attachments are intentionally pathless. Ordinary
+        // pathless refs and attachments already admitted to the live runtime
+        // pass through without another upload.
+        if ((!attachment.path && !managedAttachable) || alreadyAttached) {
           synced.push(attachment)
 
           continue
@@ -507,6 +513,7 @@ export function usePromptActions({
               // while still refusing a remove + re-add of the same path.
               patchMainComposerAttachmentOccurrence(original, {
                 attachedSessionId: nextAttachment.attachedSessionId,
+                receipt: nextAttachment.receipt,
                 label: nextAttachment.label,
                 path: nextAttachment.path,
                 refText: nextAttachment.refText,

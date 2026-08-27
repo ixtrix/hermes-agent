@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 
 import { gatewayEventCompletedFileDiff } from '@/lib/gateway-events'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { managedProductPlane } from '@/lib/managed-product'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import {
   $previewTabs,
@@ -22,11 +23,46 @@ type EventHandler = (event: RpcEvent) => void
 interface PreviewRoutingOptions {
   baseHandleGatewayEvent: EventHandler
   currentCwd: string
+  managedPlane?: 'external' | 'internal' | null
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 }
 
 function asRecord(payload: unknown): Record<string, unknown> {
   return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
+}
+
+const ACTIVITY_ID_RE = /^[a-f0-9]{32}$/
+const BROWSER_IDENTITY_RE = /^staff-browser:[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/
+const RUNNER_EPOCH_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/
+const seenBrowserActivityIds = new Set<string>()
+const seenBrowserActivityOrder: string[] = []
+const latestBrowserActivityByIdentity = new Map<string, string>()
+
+function rememberBrowserActivity(activityId: string): boolean {
+  if (seenBrowserActivityIds.has(activityId)) {
+    return false
+  }
+
+  seenBrowserActivityIds.add(activityId)
+  seenBrowserActivityOrder.push(activityId)
+
+  if (seenBrowserActivityOrder.length > 256) {
+    seenBrowserActivityIds.delete(seenBrowserActivityOrder.shift()!)
+  }
+
+  return true
+}
+
+function validViewerUrl(value: unknown): value is string {
+  if (typeof value !== 'string') {
+    return false
+  }
+
+  try {
+    return new URL(value).protocol === 'https:'
+  } catch {
+    return false
+  }
 }
 
 function sessionIsOnScreen(sessionId: string): boolean {
@@ -37,7 +73,12 @@ function sessionIsOnScreen(sessionId: string): boolean {
   )
 }
 
-export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestGateway }: PreviewRoutingOptions) {
+export function usePreviewRouting({
+  baseHandleGatewayEvent,
+  currentCwd,
+  managedPlane = managedProductPlane,
+  requestGateway
+}: PreviewRoutingOptions) {
   const restartPreviewServer = useCallback(
     async (url: string, context?: string) => {
       const sessionId = $focusedRuntimeId.get()
@@ -71,6 +112,64 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
   const handleDesktopGatewayEvent = useCallback<EventHandler>(
     event => {
       baseHandleGatewayEvent(event)
+
+      if (event.type === 'browser.activity') {
+        if (managedPlane !== 'external' || !event.session_id || !sessionIsOnScreen(event.session_id)) {
+          return
+        }
+
+        const payload = asRecord(event.payload)
+        const activityId = typeof payload.activity_id === 'string' ? payload.activity_id : ''
+        const identity = typeof payload.identity === 'string' ? payload.identity : ''
+        const runnerEpoch = typeof payload.runner_epoch === 'string' ? payload.runner_epoch : ''
+        const label = typeof payload.label === 'string' ? payload.label.trim().slice(0, 120) : ''
+
+        if (
+          !ACTIVITY_ID_RE.test(activityId) ||
+          !BROWSER_IDENTITY_RE.test(identity) ||
+          !RUNNER_EPOCH_RE.test(runnerEpoch) ||
+          !rememberBrowserActivity(activityId)
+        ) {
+          return
+        }
+
+        latestBrowserActivityByIdentity.set(identity, activityId)
+        const sessionId = event.session_id
+        void requestGateway('browser.viewer.ticket', {
+          activity_id: activityId,
+          identity,
+          runner_epoch: runnerEpoch,
+          session_id: sessionId
+        })
+          .then(value => {
+            const ticket = asRecord(value)
+
+            if (
+              latestBrowserActivityByIdentity.get(identity) !== activityId ||
+              !sessionIsOnScreen(sessionId) ||
+              ticket.activity_id !== activityId ||
+              ticket.identity !== identity ||
+              !validViewerUrl(ticket.url)
+            ) {
+              return
+            }
+
+            openPreview(
+              {
+                identity,
+                kind: 'url',
+                label: typeof ticket.label === 'string' ? ticket.label.trim().slice(0, 120) || label : label,
+                source: 'browser.activity',
+                transient: true,
+                url: ticket.url
+              },
+              'tool-result'
+            )
+          })
+          .catch(() => undefined)
+
+        return
+      }
 
       if (event.type === 'preview.open') {
         // Agent-driven open in response to an explicit user request ("show
@@ -173,7 +272,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         requestPreviewReload()
       }
     },
-    [baseHandleGatewayEvent, currentCwd]
+    [baseHandleGatewayEvent, currentCwd, managedPlane, requestGateway]
   )
 
   return { handleDesktopGatewayEvent, restartPreviewServer }

@@ -15,11 +15,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import is_truthy_value
+from tools.browser_exec_executor import (
+    BrowserExecExecutor,
+    BrowserExecOutcome,
+    BrowserExecProbe,
+    BrowserExecRequest,
+    StaffUdsBrowserExecExecutor,
+)
 
 logger = logging.getLogger(__name__)
 
 _BACKEND_KEY = "browser-use"
 BACKEND_DISABLED = "off"
+_STAFF_RUNNER_SOCKET_ENV = "HERMES_BROWSER_EXEC_RUNNER_SOCKET"
+_STAFF_RUNNER_IMAGE_ENV = "HERMES_BROWSER_EXEC_RUNNER_IMAGE_IDENTITY"
 
 # Cloud daemon names become the BU_NAME env var
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -213,6 +222,27 @@ def is_legacy_browser_use_cloud_config(browser_cfg: dict) -> bool:
     return bool(os.getenv("BROWSER_USE_API_KEY"))
 
 
+def _staff_runner_configured() -> bool:
+    return bool(os.environ.get(_STAFF_RUNNER_SOCKET_ENV))
+
+
+def _get_browser_exec_executor() -> BrowserExecExecutor:
+    socket_path = os.environ.get(_STAFF_RUNNER_SOCKET_ENV)
+    if socket_path:
+        return StaffUdsBrowserExecExecutor(
+            socket_path,
+            os.environ.get(_STAFF_RUNNER_IMAGE_ENV, ""),
+        )
+    return _LocalBrowserExecExecutor()
+
+
+def _executor_probe() -> BrowserExecProbe:
+    try:
+        return _get_browser_exec_executor().probe()
+    except (RuntimeError, ValueError) as exc:
+        return BrowserExecProbe(False, "staff-uds", str(exc))
+
+
 def is_browser_use_cli_mode() -> bool:
     """True when the Browser Use CLI replaces the built-in browser stack.
 
@@ -233,13 +263,16 @@ def is_browser_use_cli_mode() -> bool:
     except Exception as e:
         logger.debug("Camofox activity check failed: %s", e)
     backend = get_browser_backend()
-    if backend:
-        return backend == _BACKEND_KEY
+    if backend and backend != _BACKEND_KEY:
+        return False
+    if _staff_runner_configured():
+        return _executor_probe().available
+    if backend == _BACKEND_KEY:
+        return True
     if is_legacy_browser_use_cloud_config(_read_browser_cfg()):
         return True
-    # Default (backend unset): Browser Use mode when the CLI can run at all;
-    # otherwise keep the built-in tools so browsing never silently breaks.
-    return _find_cli() is not None
+    # Default (backend unset): Browser Use mode when the local executor can run.
+    return _executor_probe().available
 
 
 _NOTICE_STAMP_NAME = ".browser_use_default_notice"
@@ -264,7 +297,7 @@ def default_downgrade_notice() -> Optional[str]:
                 return None
         except Exception:
             pass
-        if _find_cli() is not None:
+        if _executor_probe().available:
             return None
 
         from hermes_constants import get_hermes_home
@@ -355,6 +388,9 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
 
     Returns ``(ok, message)`` — never raises.
     """
+    if _staff_runner_configured():
+        probe = _executor_probe()
+        return probe.available, probe.detail
     # MANAGED-FIRST: only the managed copy short-circuits the install. A
     # browser-use found on PATH is a user-level side install — it must NOT
     # prevent provisioning the canonical Hermes-managed copy, or resolution
@@ -453,7 +489,9 @@ def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     return None
 
 
-def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
+def _native_screenshot_result(
+    result: Dict[str, Any], path: str
+) -> Optional[Dict[str, Any]]:
     """Build a multimodal tool result attaching path for vision models"""
     try:
         from pathlib import Path
@@ -485,8 +523,7 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
                 {
                     "type": "text",
                     "text": (
-                        text
-                        + "\n\nThe screenshot from this call is attached — "
+                        text + "\n\nThe screenshot from this call is attached — "
                         "inspect it with your native vision."
                     ),
                 },
@@ -545,7 +582,11 @@ def _resolve_backend_cdp(
     except Exception:
         override = ""
     if override:
-        env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
+        env[
+            "BU_CDP_URL"
+            if override.startswith(("http://", "https://"))
+            else "BU_CDP_WS"
+        ] = override
         return None
 
     try:
@@ -575,7 +616,11 @@ def _resolve_backend_cdp(
         # Named sessions get their OWN provider browser, keyed by name so the
         # same name reuses one browser across calls and tasks, and different
         # names never collide. Unnamed calls keep the per-task key.
-        cache_key = f"bu-named-{session_name}" if session_name else (task_id or "browser-exec-default")
+        cache_key = (
+            f"bu-named-{session_name}"
+            if session_name
+            else (task_id or "browser-exec-default")
+        )
         session_info = _get_session_info(cache_key)
     except Exception as e:
         return (
@@ -670,8 +715,121 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     if err:
         return err
     if cdp:
-        env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
+        env[
+            "BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"
+        ] = cdp
     return None
+
+
+class _LocalBrowserExecExecutor:
+    def probe(self) -> BrowserExecProbe:
+        available = _find_cli() is not None
+        detail = (
+            "Local browser-use CLI available"
+            if available
+            else (
+                "browser-use CLI not found on PATH, and uvx is unavailable for a "
+                "zero-install run. Install it with `uv tool install browser-use` "
+                "(or `pipx install browser-use`), then run `browser-use --doctor` "
+                "to verify the setup."
+            )
+        )
+        return BrowserExecProbe(available, "local", detail)
+
+    def execute(self, request: BrowserExecRequest) -> BrowserExecOutcome:
+        cmd = _find_cli()
+        if not cmd:
+            return BrowserExecOutcome(
+                execution_id="",
+                status="runner_unavailable",
+                started=False,
+                exit_code=None,
+                stdout="",
+                stderr="browser-use CLI is unavailable",
+            )
+
+        env = _base_subprocess_env()
+        session = request.model_session_suffix
+        if session:
+            env["BU_NAME"] = session
+        rp_err = _resolve_real_profile_cdp(env, force_local=request.local)
+        if rp_err:
+            raise RuntimeError(rp_err)
+        if request.local and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS")):
+            if not _real_profile_consented():
+                raise RuntimeError(
+                    "local=true was requested but browser.use_real_profile is off. "
+                    "Enable it in config.yaml (browser.use_real_profile: true) or "
+                    "the desktop Settings → Browser section, then retry."
+                )
+        backend_err = _resolve_backend_cdp(
+            env,
+            request.task_id,
+            session_name=session,
+        )
+        if backend_err:
+            raise RuntimeError(backend_err)
+
+        private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+        code = request.code
+        if session and not private_browser:
+            code = _OWN_TAB_PREAMBLE + code
+
+        workspace = _workspace_dir(request.task_id)
+        if workspace:
+            env["BH_AGENT_WORKSPACE"] = workspace
+        if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(
+            _read_browser_cfg()
+        ):
+            env["BU_AUTOSPAWN"] = "1"
+
+        popen_extra: dict = {}
+        if os.name == "nt":
+            try:
+                from hermes_cli._subprocess_compat import windows_hide_flags
+
+                popen_extra["creationflags"] = windows_hide_flags()
+                startup_info = subprocess.STARTUPINFO()
+                startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                popen_extra["startupinfo"] = startup_info
+            except Exception as exc:
+                logger.debug("Windows hide-flags unavailable: %s", exc)
+
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=request.timeout_s,
+                env=env,
+                **popen_extra,
+            )
+        except subprocess.TimeoutExpired:
+            return BrowserExecOutcome(
+                execution_id="",
+                status="timed_out",
+                started=True,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                workspace=workspace,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Failed to launch browser-use CLI: {exc}") from exc
+
+        return BrowserExecOutcome(
+            execution_id="",
+            status="ok" if proc.returncode == 0 else "process_error",
+            started=True,
+            exit_code=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            session=session,
+            screenshot_path=_find_screenshot(proc.stdout or "", started),
+            workspace=workspace,
+        )
 
 
 def browser_exec(
@@ -680,141 +838,105 @@ def browser_exec(
     timeout_s: int = _DEFAULT_TIMEOUT_S,
     task_id: Optional[str] = None,
     local: bool = False,
+    trusted_session_id: str = "",
 ):
-    """Run Python code through the browser-use CLI, and return its output"""
+    """Run Python code through the selected Browser Exec executor."""
     from tools.registry import tool_error, tool_result
 
     if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+        return tool_error(
+            "No code provided. Pass Python that uses the pre-imported helpers, "
+            'e.g. new_tab("https://example.com") then print(page_info()).'
+        )
 
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
-
-    cmd = _find_cli()
-    if not cmd:
+    if session and not _SESSION_RE.match(session):
         return tool_error(
-            "browser-use CLI not found on PATH, and uvx is unavailable for a "
-            "zero-install run. Install it with `uv tool install browser-use` "
-            "(or `pipx install browser-use`), then run `browser-use --doctor` "
-            "to verify the setup."
+            f"Invalid session name {session!r}: use 1-64 letters, digits, "
+            "dashes, or underscores (e.g. 'r7k2')."
         )
-
-    env = _base_subprocess_env()
-    if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(
-                f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                "dashes, or underscores (e.g. 'r7k2')."
-            )
-        env["BU_NAME"] = session
-    # Real-profile consent: on a local backend this upgrades the attach to
-    # the user's default browser (profile snapshot, logins included); with
-    # local=True it forces that even under a cloud backend. Runs BEFORE
-    # provider resolution so a real-profile hit short-circuits the cloud
-    # path via the BU_CDP_* env contract.
-    rp_err = _resolve_real_profile_cdp(env, force_local=bool(local))
-    if rp_err:
-        return tool_error(rp_err)
-    if local and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS")):
-        # local=True is only served by the real-profile route; anything else
-        # (consent off — schema normally hidden, but be explicit; or an
-        # operator CDP override owning the session) must not pretend.
-        if not _real_profile_consented():
-            return tool_error(
-                "local=true was requested but browser.use_real_profile is off. "
-                "Enable it in config.yaml (browser.use_real_profile: true) or "
-                "the desktop Settings → Browser section, then retry."
-            )
-    # Route through the configured browser backend (Browserbase, Firecrawl,
-    # Nous gateway, CDP override, local Chrome, …). Named sessions compose
-    # with the backend: BU_NAME namespaces the harness daemon (its IPC
-    # socket, log, and pid), and on provider backends the name additionally
-    # keys its own cloud browser — so concurrent sessions stop clobbering
-    # each other's daemon (#86894). Browser Use direct-API cloud configs
-    # are the one exception: the CLI manages named cloud browsers natively,
-    # and _resolve_backend_cdp skips provider resolution for them.
-    backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
-    if backend_err:
-        return tool_error(backend_err)
-
-    # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
-    # attaches to the first existing page — the same page a sibling daemon
-    # may hold. Pin each named session to a tab it created before running
-    # the model's code. Private per-name browsers (provider-keyed or BU
-    # cloud) skip this: no one to collide with, and the extra tab would leak.
-    private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
-
-    workspace = _workspace_dir(task_id)
-    if workspace:
-        env["BH_AGENT_WORKSPACE"] = workspace
-
-    # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
-    # local Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
-        env["BU_AUTOSPAWN"] = "1"
-
     try:
         timeout = max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))
     except (TypeError, ValueError):
         timeout = _DEFAULT_TIMEOUT_S
 
-    # Windows: hide the console the .cmd shim would flash (as browser_tool does)
-    popen_extra: dict = {}
-    if os.name == "nt":
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            popen_extra["creationflags"] = windows_hide_flags()
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            popen_extra["startupinfo"] = _si
-        except Exception as e:
-            logger.debug("Windows hide-flags unavailable: %s", e)
-
-    started = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
+        executor = _get_browser_exec_executor()
+        probe = executor.probe()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(str(exc))
+    if not probe.available:
+        return tool_error(probe.detail)
+
+    try:
+        outcome = executor.execute(
+            BrowserExecRequest(
+                code=code,
+                conversation_id=trusted_session_id,
+                model_session_suffix=session,
+                timeout_s=timeout,
+                task_id=task_id,
+                local=bool(local),
+            )
         )
-    except subprocess.TimeoutExpired:
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(str(exc))
+
+    if probe.adapter == "staff-uds":
+        from hermes_cli.managed_browser import record_browser_activity
+
+        record_browser_activity(
+            conversation_id=trusted_session_id,
+            execution_id=outcome.execution_id,
+            runner_session=outcome.session,
+            runner_epoch=outcome.runner_epoch,
+            started=outcome.started,
+        )
+
+    if outcome.status in {"timed_out", "unknown_outcome"}:
+        qualifier = (
+            " The runner could not prove whether browser side effects completed."
+            if outcome.status == "unknown_outcome"
+            else ""
+        )
         return tool_error(
-            f"browser-use exec timed out after {timeout}s. The daemon may "
-            "still be working; retry with a larger timeout_s (max "
-            f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
-            "append to workspace files — anything already written to the "
-            "workspace is preserved."
+            f"browser-use exec timed out after {timeout}s.{qualifier} The daemon "
+            "may still be working; do not assume it is safe to replay the call. "
+            "Retry with a larger timeout_s (max "
+            f"{_MAX_TIMEOUT_S}), or split the work into several calls that append "
+            "to workspace files."
         )
-    except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+    if outcome.status not in {"ok", "process_error"}:
+        messages = {
+            "cancelled": "Browser Exec was cancelled.",
+            "busy": "The Staff browser runner is busy; try again later.",
+            "runner_unavailable": "The Staff browser runner is unavailable.",
+            "version_mismatch": "The Staff browser runner version is not admitted.",
+            "unauthorized": "The Staff browser runner rejected this gateway.",
+            "invalid_request": "The Staff browser runner rejected the request.",
+            "internal_error": "The Staff browser runner could not complete the request.",
+        }
+        return tool_error(messages.get(outcome.status, "Browser Exec failed."))
 
     result = {
-        "success": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "success": outcome.status == "ok",
+        "exit_code": outcome.exit_code,
+        "output": outcome.stdout,
     }
-    if workspace:
-        result["workspace"] = workspace
+    if outcome.workspace:
+        result["workspace"] = outcome.workspace
     if session:
         result["session"] = session
-    stderr = (proc.stderr or "").strip()
+    stderr = outcome.stderr.strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
         result["stderr"] = stderr
-
-    screenshot = _find_screenshot(proc.stdout, started)
-    if screenshot:
-        result["screenshot_path"] = screenshot
-        native = _native_screenshot_result(result, screenshot)
+    if outcome.screenshot_path:
+        result["screenshot_path"] = outcome.screenshot_path
+        native = _native_screenshot_result(result, outcome.screenshot_path)
         if native is not None:
             return native
     return tool_result(result)
@@ -877,6 +999,7 @@ def _description_header() -> str:
         pass
     return _HEADER_BASE + _HEADER_TEXT_ONLY
 
+
 _skill_text_cache: Optional[str] = None
 _skill_text_fetched = False
 
@@ -938,7 +1061,10 @@ def _dynamic_schema_overrides() -> dict:
             ),
             "default": False,
         }
-        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+        overrides["parameters"] = {
+            **BROWSER_EXEC_SCHEMA["parameters"],
+            "properties": props,
+        }
     return overrides
 
 
@@ -988,6 +1114,7 @@ registry.register(
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S),
         task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
+        trusted_session_id=kw.get("session_id") or "",
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

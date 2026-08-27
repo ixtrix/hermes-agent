@@ -13,7 +13,13 @@
 import { useStore } from '@nanostores/react'
 
 import { findGroup } from '@/components/pane-shell/tree/model'
-import { $activeTreeGroup, $layoutTree, revealTreePane, treePanesWithPrefix } from '@/components/pane-shell/tree/store'
+import {
+  $activeTreeGroup,
+  $layoutTree,
+  revealTreePane,
+  setPaneCollapsed,
+  treePanesWithPrefix
+} from '@/components/pane-shell/tree/store'
 import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
@@ -28,6 +34,7 @@ import {
   type BrowserPage,
   closeRightRailTab,
   forgetBrowserPage,
+  isManagedCollaborativeBrowser,
   markBrowserTabPopped,
   newBrowserTab,
   popOutBrowserTab,
@@ -260,6 +267,11 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   anchor: tab => existingPreviewAnchor(tab.id),
   minWidth: '22rem',
   title: previewTitle,
+  lifecycleKeepAlive: tabId => {
+    const target = targetFor(tabId)
+
+    return target ? isManagedCollaborativeBrowser(target) : false
+  },
   tabLead: tabId => <PreviewTabLead tabId={tabId} />,
   tabTitle: tabId => (targetFor(tabId)?.kind === 'url' ? <BrowserTabLabel tabId={tabId} /> : undefined),
   // A Browser is a vessel, so there can be more of it — a file peek is one of
@@ -268,6 +280,14 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   tabMenuPrefix: browserTabMenuPrefix,
   render: tabId => <PreviewTilePane tabId={tabId} />,
   close: tabId => {
+    const target = targetFor(tabId)
+
+    if (target && isManagedCollaborativeBrowser(target)) {
+      setPaneCollapsed(previewPaneId(tabId), true)
+
+      return
+    }
+
     forgetBrowserPage(tabId)
     forgetPreviewConsole(tabId)
     closeRightRailTab(tabId)

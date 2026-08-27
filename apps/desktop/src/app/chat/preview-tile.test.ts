@@ -8,6 +8,7 @@ vi.mock('./right-rail/preview-console-store', () => ({
   forgetPreviewConsole: () => undefined
 }))
 
+import { closeTreePane } from '@/components/pane-shell/tree/store'
 import { contributesToWorkspace } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import { $previewTabs, closeRightRail, noteBrowserPage, openPreview } from '@/store/preview'
@@ -19,6 +20,7 @@ beforeAll(() => {
 })
 
 afterEach(() => {
+  $previewTabs.set([])
   closeRightRail()
 })
 
@@ -41,6 +43,27 @@ describe('preview tiles in Bot Mode', () => {
     expect(pane?.workspaceMode).toBeUndefined()
     expect(contributesToWorkspace(pane, 'sessions')).toBe(true)
     expect(contributesToWorkspace(pane, 'bots', 'bot:connection-a::default')).toBe(true)
+  })
+})
+
+describe('managed collaborative browser tile', () => {
+  it('stays mounted and registered when its close affordance hides the rail', () => {
+    openPreview({
+      identity: 'staff-browser:web-ben',
+      kind: 'url',
+      label: 'Collaborative Browser',
+      source: 'browser.activity',
+      transient: true,
+      url: 'https://viewer.example/ticket'
+    })
+    const tab = $previewTabs.get()[0]!
+    const paneId = `preview-tile:${tab.id}`
+    const pane = registry.getArea('panes').find(entry => entry.id === paneId)
+
+    expect((pane?.data as { lifecycleKeepAlive?: boolean }).lifecycleKeepAlive).toBe(true)
+    closeTreePane(paneId)
+    expect($previewTabs.get()).toHaveLength(1)
+    expect(registry.getArea('panes').some(entry => entry.id === paneId)).toBe(true)
   })
 })
 

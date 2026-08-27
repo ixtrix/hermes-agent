@@ -7,6 +7,7 @@ import {
   resolveGatewayEventSessionId,
   UNSCOPED_STREAM_EVENT_TYPES
 } from '@/lib/gateway-events'
+import { isManagedProductBuild } from '@/lib/managed-product'
 import { setSessionCompacting } from '@/store/compaction'
 import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -25,6 +26,23 @@ import { handleToolEvent } from './tools'
 import type { GatewayEventContext, GatewayEventDeps, GatewayEventHandler } from './types'
 
 export type { GatewayEventDeps } from './types'
+export const MANAGED_CALLBACK_ALLOWLIST: Record<string, true> = {}
+
+export function shouldRejectManagedBridgeEvent(type: unknown, managed = isManagedProductBuild): boolean {
+  return (
+    managed &&
+    typeof type === 'string' &&
+    !(type in MANAGED_CALLBACK_ALLOWLIST) &&
+    /callback|bridge|app(?:[.:_-]control)/i.test(type)
+  )
+}
+
+function auditRejectedManagedBridgeEvent(type: unknown): void {
+  console.warn('[hermes] rejected managed Desktop bridge event', {
+    type: typeof type === 'string' ? type : '<unknown>'
+  })
+}
+
 
 /**
  * Events that retire a "drafting a tool call" claim.
@@ -133,6 +151,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
   return useCallback(
     (event: RpcEvent) => {
+      if (shouldRejectManagedBridgeEvent(event.type)) {
+        auditRejectedManagedBridgeEvent(event.type)
+        return
+      }
+
       const payload = event.payload as GatewayEventPayload | undefined
 
       // "From the active profile" must mean "from the active SOURCE": every

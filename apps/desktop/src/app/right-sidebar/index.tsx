@@ -19,6 +19,7 @@ import { SidebarPanelLabel } from '../shell/sidebar-label'
 
 import { ProjectTree } from './files/tree'
 import { useProjectTree } from './files/use-project-tree'
+import { SidebarSurfaceGroup } from './sidebar-surface-group'
 
 interface RightSidebarPaneProps {
   onActivateFile: (path: string) => void
@@ -83,23 +84,31 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
           : 'border-l shadow-[inset_0.0625rem_0_0_color-mix(in_srgb,white_18%,transparent)]'
       )}
     >
-      <FilesystemTab
-        canCollapse={canCollapse}
-        collapseNonce={collapseNonce}
-        cwd={effectiveCwd}
-        cwdName={cwdName}
-        data={data}
-        error={rootError}
-        hasWorkspace={hasWorkspace}
-        loading={rootLoading}
-        onActivateFile={onActivateFile}
-        onActivateFolder={onActivateFolder}
-        onCollapseAll={collapseAll}
-        onLoadChildren={loadChildren}
-        onNodeOpenChange={setNodeOpen}
-        onPreviewFile={previewFile}
-        onRefresh={() => void refreshRoot()}
-        openState={openState}
+      <SidebarSurfaceGroup
+        core={{
+          id: 'files',
+          render: () => (
+            <FilesystemTab
+              canCollapse={canCollapse}
+              collapseNonce={collapseNonce}
+              cwd={effectiveCwd}
+              cwdName={cwdName}
+              data={data}
+              error={rootError}
+              hasWorkspace={hasWorkspace}
+              loading={rootLoading}
+              onActivateFile={onActivateFile}
+              onActivateFolder={onActivateFolder}
+              onCollapseAll={collapseAll}
+              onLoadChildren={loadChildren}
+              onNodeOpenChange={setNodeOpen}
+              onPreviewFile={previewFile}
+              onRefresh={() => void refreshRoot()}
+              openState={openState}
+            />
+          ),
+          title: r.files
+        }}
       />
     </aside>
   )

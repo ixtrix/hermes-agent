@@ -52,6 +52,8 @@ export interface PaneMirror<T> {
   /** Mint another tile of this kind — the strip's "+" (see PaneChrome.newTab).
    *  Per tile so a mirror can offer it for some of its tabs and not others. */
   newTab?: (key: string) => (() => void) | undefined
+  /** Keep a mounted surface alive while its zone is minimized or inactive. */
+  lifecycleKeepAlive?: (key: string) => boolean
   render: (key: string) => ReactNode
   /** Extra rows at the top of the zone tab menu (see PaneChrome.tabMenuPrefix). */
   tabMenuPrefix?: (key: string) => ((kit: MenuKit) => ReactNode) | undefined
@@ -107,6 +109,7 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
             pane: cfg.anchor?.(tile) ?? 'workspace',
             pos: cfg.dir?.(tile) ?? 'right'
           },
+          lifecycleKeepAlive: cfg.lifecycleKeepAlive?.(key),
           minWidth: cfg.minWidth,
           newTab: cfg.newTab?.(key),
           // Every mirrored tile is a full workspace surface docked beside main —

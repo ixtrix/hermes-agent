@@ -20,12 +20,14 @@ function fileTarget(path: string): PreviewTarget {
 }
 
 let handleEvent: (event: RpcEvent) => void = () => undefined
+const requestGateway = vi.fn()
 
-function Harness() {
+function Harness({ managedPlane }: { managedPlane?: 'external' | 'internal' | null }) {
   const routing = usePreviewRouting({
     baseHandleGatewayEvent: vi.fn(),
     currentCwd: '/work',
-    requestGateway: vi.fn()
+    managedPlane,
+    requestGateway
   })
 
   useEffect(() => {
@@ -61,7 +63,8 @@ describe('preview routing', () => {
     $activeSessionId.set(RUNTIME_SESSION_ID)
     $currentCwd.set('/work')
     $messages.set([])
-    closeRightRail()
+    $previewTabs.set([])
+    requestGateway.mockReset()
     window.localStorage.clear()
 
     Object.defineProperty(window, 'hermesDesktop', {
@@ -72,7 +75,7 @@ describe('preview routing', () => {
 
   afterEach(() => {
     cleanup()
-    $messages.set([])
+    $previewTabs.set([])
     closeRightRail()
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
@@ -202,6 +205,82 @@ describe('preview routing', () => {
         } as unknown as RpcEvent)
       })
 
+      expect($previewTabs.get()).toHaveLength(0)
+    })
+  })
+
+  describe('managed browser activity', () => {
+    it('mints a viewer ticket for an on-screen External activity and reuses its stable transient tab', async () => {
+      requestGateway
+        .mockResolvedValueOnce({
+          activity_id: 'a'.repeat(32),
+          identity: 'staff-browser:scope-runtime-1',
+          label: 'Collaborative Browser',
+          url: 'https://external.example/browser-viewer/?ticket=first'
+        })
+        .mockResolvedValueOnce({
+          activity_id: 'b'.repeat(32),
+          identity: 'staff-browser:scope-runtime-1',
+          label: 'Collaborative Browser',
+          url: 'https://external.example/browser-viewer/?ticket=second'
+        })
+      render(<Harness managedPlane="external" />)
+
+      for (const activityId of ['a'.repeat(32), 'b'.repeat(32)]) {
+        await act(async () => {
+          handleEvent({
+            payload: {
+              activity_id: activityId,
+              identity: 'staff-browser:scope-runtime-1',
+              label: 'Collaborative Browser',
+              runner_epoch: 'epoch-1'
+            },
+            session_id: RUNTIME_SESSION_ID,
+            type: 'browser.activity'
+          } as unknown as RpcEvent)
+        })
+      }
+
+      await waitFor(() => expect($previewTabs.get()[0]?.target.url).toContain('ticket=second'))
+      expect($previewTabs.get()).toHaveLength(1)
+      expect($previewTabs.get()[0]?.target).toMatchObject({
+        identity: 'staff-browser:scope-runtime-1',
+        source: 'browser.activity',
+        transient: true
+      })
+      expect(requestGateway).toHaveBeenCalledTimes(2)
+    })
+
+    it('ignores duplicate, hidden-session, and Internal activity events', async () => {
+      requestGateway.mockResolvedValue({
+        activity_id: 'c'.repeat(32),
+        identity: 'staff-browser:scope-runtime-1',
+        label: 'Collaborative Browser',
+        url: 'https://external.example/browser-viewer/?ticket=secret'
+      })
+      const { unmount } = render(<Harness managedPlane="external" />)
+      const event = {
+        payload: {
+          activity_id: 'c'.repeat(32),
+          identity: 'staff-browser:scope-runtime-1',
+          label: 'Collaborative Browser',
+          runner_epoch: 'epoch-1'
+        },
+        session_id: 'hidden-session',
+        type: 'browser.activity'
+      } as unknown as RpcEvent
+
+      await act(async () => {
+        handleEvent(event)
+        handleEvent(event)
+      })
+      unmount()
+      render(<Harness managedPlane="internal" />)
+      await act(async () => {
+        handleEvent({ ...event, session_id: RUNTIME_SESSION_ID })
+      })
+
+      expect(requestGateway).not.toHaveBeenCalled()
       expect($previewTabs.get()).toHaveLength(0)
     })
   })

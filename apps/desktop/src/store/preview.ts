@@ -31,6 +31,8 @@ export interface PreviewTarget {
   /** `artifact` targets have nothing behind them on disk or on the network —
    * `url` is an id into the artifact registry, which owns the content. They
    * are what lets the rail preview generated HTML the workspace never saw. */
+  /** Stable runtime identity for a rotating credential-bearing URL. */
+  identity?: string
   kind: 'artifact' | 'file' | 'url'
   label: string
   large?: boolean
@@ -77,7 +79,8 @@ function isPreviewTarget(value: unknown): value is PreviewTarget {
     (r.kind === 'artifact' || r.kind === 'file' || r.kind === 'url') &&
     typeof r.label === 'string' &&
     typeof r.source === 'string' &&
-    typeof r.url === 'string'
+    typeof r.url === 'string' &&
+    (r.identity === undefined || typeof r.identity === 'string')
   )
 }
 
@@ -335,10 +338,23 @@ export const $previewServerRestartStatus = computed($previewServerRestart, resta
  *  already has. A URL has no identity here: a Browser tab is a vessel you
  *  navigate, so it is picked (`browserTabId`) rather than derived. */
 export function previewTabId(target: PreviewTarget): RightRailTabId {
+  if (target.kind === 'url' && target.identity) {
+    return `url:identity:${target.identity}`
+  }
+
   return `${target.kind}:${target.url}`
 }
 
 const isBrowserTab = (tab: PreviewTab): boolean => tab.target.kind === 'url'
+
+export function isManagedCollaborativeBrowser(target: PreviewTarget): boolean {
+  return (
+    target.kind === 'url' &&
+    target.transient === true &&
+    typeof target.identity === 'string' &&
+    target.identity.startsWith('staff-browser:')
+  )
+}
 
 /** A Browser tab's id, minted the way a terminal's is — there is no identity to
  *  derive one from. Random rather than the lowest free slot: an id is never
@@ -385,7 +401,7 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
-  const id = resolved.kind === 'url' ? browserTabId(current) : previewTabId(resolved)
+  const id = resolved.kind === 'url' && !resolved.identity ? browserTabId(current) : previewTabId(resolved)
   const index = current.findIndex(tab => tab.id === id)
   const tab: PreviewTab = { id, target: resolved }
 
@@ -475,9 +491,13 @@ export function closeArtifactPreviewTabs() {
   }
 }
 
-/** Close every tab so the rail's panes leave the tree. */
+/** Hide the rail without discarding the managed collaborative browser. Its
+ * credential-bearing URL remains runtime-only, and re-opening its identity
+ * re-fronts the still-live pane. Ordinary previews keep their close behavior. */
 export function closeRightRail() {
-  $previewTabs.set([])
+  const retained = $previewTabs.get().filter(tab => isManagedCollaborativeBrowser(tab.target))
+
+  $previewTabs.set(retained)
   selectRightRailTab(null)
 }
 

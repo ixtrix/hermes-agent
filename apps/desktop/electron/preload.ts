@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
+import { isManagedProductBuild } from './managed-product'
+
 // Which translucency the OS can back. Asked synchronously because the renderer
 // needs it before its first paint, and answered by main because deciding it
 // needs `os.release()` — a sandboxed preload may only require electron, events,
@@ -10,8 +12,6 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
-
-import { isManagedProductBuild } from './managed-product'
 
 const MANAGED_PRODUCT_BUILD = isManagedProductBuild
 
@@ -537,11 +537,8 @@ const managedDesktopBridge = {
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get')
   },
-  saveExport: (exportId, suggestedName) =>
-    ipcRenderer.invoke('hermes:managed:export-save', exportId, suggestedName)
+  saveExport: (exportId, suggestedName) => ipcRenderer.invoke('hermes:managed:export-save', exportId, suggestedName),
+  workstationFolders: (op, payload) => ipcRenderer.invoke('hermes:workstationFolders', op, payload)
 }
 
-contextBridge.exposeInMainWorld(
-  'hermesDesktop',
-  MANAGED_PRODUCT_BUILD ? managedDesktopBridge : ordinaryDesktopBridge
-)
+contextBridge.exposeInMainWorld('hermesDesktop', MANAGED_PRODUCT_BUILD ? managedDesktopBridge : ordinaryDesktopBridge)

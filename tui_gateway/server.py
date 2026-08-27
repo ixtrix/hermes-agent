@@ -7645,6 +7645,21 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
         _emit("tool.complete", sid, payload)
+    if name == "browser_exec":
+        from hermes_cli.managed_browser import consume_browser_activity
+
+        activity = consume_browser_activity(sid)
+        if activity is not None:
+            _emit(
+                "browser.activity",
+                sid,
+                {
+                    "activity_id": activity.activity_id,
+                    "identity": activity.identity,
+                    "label": activity.label,
+                    "runner_epoch": activity.runner_epoch,
+                },
+            )
 
 
 def _on_tool_progress(
@@ -17457,6 +17472,7 @@ from . import (  # noqa: E402
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
     methods_session as _methods_session,
+    methods_staff_browser as _methods_staff_browser,
     methods_tools as _methods_tools,
 )
 from .methods_prompt import (
@@ -17477,6 +17493,7 @@ for _m in (
     _methods_tools,
     _methods_profiles,
     _methods_images,
+    _methods_staff_browser,
     _methods_bot_relay,
 ):
     _m.register(sys.modules[__name__])

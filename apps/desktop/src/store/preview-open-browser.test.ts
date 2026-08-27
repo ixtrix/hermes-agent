@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { $previewTabs, closeRightRail, openBrowserTab, openPreview } from './preview'
 
 beforeEach(() => {
+  $previewTabs.set([])
   closeRightRail()
 })
 
@@ -47,5 +48,48 @@ describe('openBrowserTab', () => {
 
     expect(tabs).toHaveLength(2)
     expect(tabs.map(tab => tab.target.url)).toContain('file:///work/notes.md')
+  })
+})
+
+describe('managed collaborative browser', () => {
+  it('updates one transient tab by opaque identity when its signed URL rotates', () => {
+    openPreview({
+      identity: 'staff-browser:web-ben',
+      kind: 'url',
+      label: 'Collaborative Browser',
+      source: 'browser.activity',
+      transient: true,
+      url: 'https://viewer.example/first-ticket'
+    })
+    openPreview({
+      identity: 'staff-browser:web-ben',
+      kind: 'url',
+      label: 'Collaborative Browser',
+      source: 'browser.activity',
+      transient: true,
+      url: 'https://viewer.example/fresh-ticket'
+    })
+
+    const tabs = $previewTabs.get()
+
+    expect(tabs).toHaveLength(1)
+    expect(tabs[0]?.id).toBe('url:identity:staff-browser:web-ben')
+    expect(tabs[0]?.target.url).toBe('https://viewer.example/fresh-ticket')
+    expect(window.localStorage.getItem('hermes.desktop.previewTabs.v2')).toBe('[]')
+  })
+
+  it('keeps the transient browser identity when the whole rail hides', () => {
+    openPreview({
+      identity: 'staff-browser:web-ben',
+      kind: 'url',
+      label: 'Collaborative Browser',
+      source: 'browser.activity',
+      transient: true,
+      url: 'https://viewer.example/ticket'
+    })
+
+    closeRightRail()
+
+    expect($previewTabs.get()).toHaveLength(1)
   })
 })
