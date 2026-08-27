@@ -235,6 +235,20 @@ def _get_browser_exec_executor() -> BrowserExecExecutor:
         )
     return _LocalBrowserExecExecutor()
 
+def _open_staff_browser_preview(activity: Any) -> bool:
+    """Open the activity-bound viewer through the stock Desktop preview event."""
+    try:
+        from hermes_cli.managed_browser import issue_browser_viewer_ticket
+        from tools.open_preview_tool import open_preview_tool
+
+        viewer_url = issue_browser_viewer_ticket(activity)
+        response = json.loads(open_preview_tool(viewer_url, activity.label))
+        return response.get("success") is True
+    except Exception:
+        logger.debug("Could not open the Staff browser in Desktop preview")
+        return False
+
+
 
 def _executor_probe() -> BrowserExecProbe:
     try:
@@ -885,15 +899,21 @@ def browser_exec(
         return tool_error(str(exc))
 
     if probe.adapter == "staff-uds":
-        from hermes_cli.managed_browser import record_browser_activity
+        from hermes_cli.managed_browser import (
+            consume_browser_activity,
+            record_browser_activity,
+        )
 
-        record_browser_activity(
+        activity = record_browser_activity(
             conversation_id=trusted_session_id,
             execution_id=outcome.execution_id,
             runner_session=outcome.session,
             runner_epoch=outcome.runner_epoch,
             started=outcome.started,
         )
+        if activity is not None:
+            consume_browser_activity(trusted_session_id)
+            _open_staff_browser_preview(activity)
 
     if outcome.status in {"timed_out", "unknown_outcome"}:
         qualifier = (

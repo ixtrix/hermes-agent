@@ -191,8 +191,11 @@ def test_execute_rejects_response_with_wrong_execution_identity(tmp_path):
     thread.join(2)
 
 
-def test_public_staff_tool_records_started_activity_without_exposing_it(monkeypatch):
-    from tools import browser_use_cli
+def test_public_staff_tool_opens_activity_in_stock_preview_without_exposing_ticket(
+    monkeypatch,
+):
+    from hermes_cli import managed_browser
+    from tools import browser_use_cli, open_preview_tool
 
     class Executor:
         def probe(self):
@@ -210,9 +213,21 @@ def test_public_staff_tool_records_started_activity_without_exposing_it(monkeypa
                 runner_epoch="epoch-1",
             )
 
+    opened = []
     reset_browser_activity_state()
     monkeypatch.setattr(
         browser_use_cli, "_get_browser_exec_executor", lambda: Executor()
+    )
+    monkeypatch.setattr(
+        managed_browser,
+        "issue_browser_viewer_ticket",
+        lambda activity: "https://external.example/browser-viewer/?ticket=secret",
+    )
+    monkeypatch.setattr(
+        open_preview_tool,
+        "open_preview_tool",
+        lambda url, label: opened.append((url, label))
+        or json.dumps({"success": True, "url": url, "label": label}),
     )
 
     result = json.loads(
@@ -221,10 +236,13 @@ def test_public_staff_tool_records_started_activity_without_exposing_it(monkeypa
             trusted_session_id="runtime-1",
         )
     )
-    activity = consume_browser_activity("runtime-1")
 
     assert result == {"success": True, "exit_code": 0, "output": "done"}
-    assert activity is not None
-    assert activity.identity == "staff-browser:scope-runtime-1"
-    assert activity.runner_epoch == "epoch-1"
-    assert activity.activity_id not in json.dumps(result)
+    assert opened == [
+        (
+            "https://external.example/browser-viewer/?ticket=secret",
+            "Collaborative Browser",
+        )
+    ]
+    assert consume_browser_activity("runtime-1") is None
+    assert "ticket" not in json.dumps(result)
