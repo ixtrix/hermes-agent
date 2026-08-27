@@ -5757,7 +5757,9 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     if _is_managed_staff_mode():
         _install_managed_staff_adapters()
-        _plane, toolsets, _methods = _load_managed_staff_inventory()
+        plane, toolsets, _methods = _load_managed_staff_inventory()
+        if plane == "external" and session_platform == "desktop":
+            return sorted({*toolsets, "desktop_ui"})
         return toolsets
     explicit = [
         item.strip()
