@@ -5911,6 +5911,17 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
             )
         return None
 
+def _load_session_enabled_toolsets(platform: str) -> list[str] | None:
+    """Add client-surface tools after validating the process-wide Staff pin."""
+    enabled = _load_enabled_toolsets(platform)
+    if (
+        enabled is not None
+        and platform == "desktop"
+        and os.environ.get("SCOPE_STAFF_PROFILE", "").strip().lower() == "web"
+    ):
+        return sorted({*enabled, "desktop_ui"})
+    return enabled
+
 
 def _managed_profile_id(value: str | None) -> str:
     candidate = str(value or "default").strip()
@@ -8784,7 +8795,9 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        enabled_toolsets=_load_session_enabled_toolsets(
+            _resolve_agent_platform(platform_override)
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.

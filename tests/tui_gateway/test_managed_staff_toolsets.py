@@ -47,6 +47,24 @@ def test_managed_loader_adds_desktop_ui_only_to_external_desktop_sessions(
 
     assert server._load_enabled_toolsets(platform) == expected
 
+@pytest.mark.parametrize(
+    ("profile", "platform", "expected"),
+    [
+        ("web", "desktop", ["desktop_ui", "staff_runtime", "web"]),
+        ("web", "tui", ["staff_runtime", "web"]),
+        ("internal", "desktop", ["staff_runtime", "web"]),
+    ],
+)
+def test_staff_session_adds_desktop_ui_only_to_external_desktop(
+    monkeypatch, profile, platform, expected
+):
+    monkeypatch.setenv("SCOPE_STAFF_PROFILE", profile)
+    monkeypatch.setattr(
+        server, "_load_enabled_toolsets", lambda _: ["staff_runtime", "web"]
+    )
+
+    assert server._load_session_enabled_toolsets(platform) == expected
+
 
 def test_managed_inventory_rejects_empty_server_mapping(monkeypatch):
     monkeypatch.setattr(
