@@ -1952,10 +1952,6 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
-    # Tool calls are scoped to this invocation. A cached gateway agent may
-    # start a new user turn with tool results in its durable history; those
-    # prior-turn rows must not trigger post-tool empty-response recovery.
-    _turn_had_tool_calls = False
     length_continue_retries = 0
     # Total outer-loop exceptions this turn (#92450) — see _MAX_OUTER_LOOP_ERRORS.
     _outer_error_count = 0
@@ -7044,7 +7040,6 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
-                _turn_had_tool_calls = True
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -7752,11 +7747,7 @@ def run_conversation(
                         break
 
                     # ── Post-tool-call empty response nudge ───────────
-                    # The model returned empty after executing tool calls in
-                    # THIS user turn. Durable history may end with tool rows
-                    # from an earlier turn, so do not infer this state by
-                    # scanning a fixed tail of ``messages``.
-                    #
+                    # The model returned empty after executing tool calls.
                     # This covers two cases:
                     #  (a) No prior-turn content at all — model went silent
                     #  (b) Prior turn had content + SUBSTANTIVE tools (the
@@ -7768,10 +7759,15 @@ def run_conversation(
                     # return empty after tool results instead of continuing
                     # to the next step.  One retry with a nudge usually
                     # fixes it.
+                    _prior_was_tool = any(
+                        m.get("role") == "tool"
+                        for m in messages[-5:]  # check recent messages
+                    )
                     # Detect Qwen3/Ollama-style in-content thinking blocks.
                     # Ollama puts <think> in the content field (not in
-                    # reasoning_content), so structured reasoning detection
-                    # must include it.
+                    # reasoning_content), so _has_structured below would
+                    # miss it.  We check here so thinking-only responses
+                    # after tool calls route to prefill instead of nudge.
                     _has_inline_thinking = bool(
                         re.search(
                             r'<think>|<thinking>|<reasoning>',
@@ -7779,16 +7775,10 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
-                    _has_structured = bool(
-                        getattr(assistant_message, "reasoning", None)
-                        or getattr(assistant_message, "reasoning_content", None)
-                        or getattr(assistant_message, "reasoning_details", None)
-                        or _has_inline_thinking
-                    )
                     if (
-                        _turn_had_tool_calls
+                        _prior_was_tool
                         and not getattr(agent, "_post_tool_empty_retried", False)
-                        and not _has_structured
+                        and not _has_inline_thinking  # thinking model still working — let prefill handle
                     ):
                         agent._post_tool_empty_retried = True
                         # Clear stale narration so it doesn't resurface
@@ -7828,6 +7818,12 @@ def run_conversation(
                     # Inspired by clawdbot's "incomplete-text" recovery.
                     # Also covers Qwen3/Ollama in-content <think> blocks
                     # (detected above as _has_inline_thinking).
+                    _has_structured = bool(
+                        getattr(assistant_message, "reasoning", None)
+                        or getattr(assistant_message, "reasoning_content", None)
+                        or getattr(assistant_message, "reasoning_details", None)
+                        or _has_inline_thinking
+                    )
                     if _has_structured and agent._thinking_prefill_retries < 2:
                         agent._thinking_prefill_retries += 1
                         logger.info(
