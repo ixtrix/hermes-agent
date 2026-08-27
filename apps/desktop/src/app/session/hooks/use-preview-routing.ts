@@ -114,7 +114,7 @@ export function usePreviewRouting({
       baseHandleGatewayEvent(event)
 
       if (event.type === 'browser.activity') {
-        if (managedPlane !== 'external' || !event.session_id || !sessionIsOnScreen(event.session_id)) {
+        if (managedPlane === 'internal' || !event.session_id || !sessionIsOnScreen(event.session_id)) {
           return
         }
 

@@ -251,6 +251,45 @@ describe('preview routing', () => {
       expect(requestGateway).toHaveBeenCalledTimes(2)
     })
 
+    it('lets an ordinary Desktop defer External viewer authorization to the gateway', async () => {
+      const activityId = 'd'.repeat(32)
+
+      requestGateway.mockResolvedValue({
+        activity_id: activityId,
+        identity: 'staff-browser:scope-runtime-1',
+        label: 'Collaborative Browser',
+        url: 'https://external.example/browser-viewer/?ticket=ordinary'
+      })
+      render(<Harness managedPlane={null} />)
+
+      await act(async () => {
+        handleEvent({
+          payload: {
+            activity_id: activityId,
+            identity: 'staff-browser:scope-runtime-1',
+            label: 'Collaborative Browser',
+            runner_epoch: 'epoch-1'
+          },
+          session_id: RUNTIME_SESSION_ID,
+          type: 'browser.activity'
+        } as unknown as RpcEvent)
+      })
+
+      await waitFor(() => expect($previewTabs.get()).toHaveLength(1))
+      expect(requestGateway).toHaveBeenCalledWith('browser.viewer.ticket', {
+        activity_id: activityId,
+        identity: 'staff-browser:scope-runtime-1',
+        runner_epoch: 'epoch-1',
+        session_id: RUNTIME_SESSION_ID
+      })
+      expect($previewTabs.get()[0]?.target).toMatchObject({
+        identity: 'staff-browser:scope-runtime-1',
+        source: 'browser.activity',
+        transient: true,
+        url: 'https://external.example/browser-viewer/?ticket=ordinary'
+      })
+    })
+
     it('ignores duplicate, hidden-session, and Internal activity events', async () => {
       requestGateway.mockResolvedValue({
         activity_id: 'c'.repeat(32),
