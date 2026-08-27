@@ -191,11 +191,8 @@ def test_execute_rejects_response_with_wrong_execution_identity(tmp_path):
     thread.join(2)
 
 
-def test_public_staff_tool_opens_activity_in_stock_preview_without_exposing_ticket(
-    monkeypatch,
-):
-    from hermes_cli import managed_browser
-    from tools import browser_use_cli, open_preview_tool
+def test_public_staff_tool_records_started_activity_without_exposing_it(monkeypatch):
+    from tools import browser_use_cli
 
     class Executor:
         def probe(self):
@@ -213,21 +210,9 @@ def test_public_staff_tool_opens_activity_in_stock_preview_without_exposing_tick
                 runner_epoch="epoch-1",
             )
 
-    opened = []
     reset_browser_activity_state()
     monkeypatch.setattr(
         browser_use_cli, "_get_browser_exec_executor", lambda: Executor()
-    )
-    monkeypatch.setattr(
-        managed_browser,
-        "issue_browser_viewer_ticket",
-        lambda activity: "https://external.example/browser-viewer/?ticket=secret",
-    )
-    monkeypatch.setattr(
-        open_preview_tool,
-        "open_preview_tool",
-        lambda url, label: opened.append((url, label))
-        or json.dumps({"success": True, "url": url, "label": label}),
     )
 
     result = json.loads(
@@ -236,63 +221,10 @@ def test_public_staff_tool_opens_activity_in_stock_preview_without_exposing_tick
             trusted_session_id="runtime-1",
         )
     )
+    activity = consume_browser_activity("runtime-1")
 
     assert result == {"success": True, "exit_code": 0, "output": "done"}
-    assert opened == [
-        (
-            "https://external.example/browser-viewer/?ticket=secret",
-            "Collaborative Browser",
-        )
-    ]
-    assert consume_browser_activity("runtime-1") is None
-    assert "ticket" not in json.dumps(result)
-
-
-def test_public_staff_tool_does_not_open_preview_for_failed_execution(monkeypatch):
-    from hermes_cli import managed_browser
-    from tools import browser_use_cli, open_preview_tool
-
-    class Executor:
-        def probe(self):
-            return BrowserExecProbe(True, "staff-uds", "ready")
-
-        def execute(self, request):
-            return BrowserExecOutcome(
-                execution_id="exec-1",
-                status="process_error",
-                started=True,
-                exit_code=1,
-                stdout="",
-                stderr="failed",
-                session="scope-runtime-1",
-                runner_epoch="epoch-1",
-            )
-
-    issued = []
-    opened = []
-    reset_browser_activity_state()
-    monkeypatch.setattr(
-        browser_use_cli, "_get_browser_exec_executor", lambda: Executor()
-    )
-    monkeypatch.setattr(
-        managed_browser,
-        "issue_browser_viewer_ticket",
-        lambda activity: issued.append(activity) or "https://example.invalid",
-    )
-    monkeypatch.setattr(
-        open_preview_tool,
-        "open_preview_tool",
-        lambda url, label: opened.append((url, label)),
-    )
-
-    result = json.loads(
-        browser_use_cli.browser_exec(
-            "raise RuntimeError",
-            trusted_session_id="runtime-1",
-        )
-    )
-
-    assert result["success"] is False
-    assert issued == []
-    assert opened == []
-    assert consume_browser_activity("runtime-1") is None
+    assert activity is not None
+    assert activity.identity == "staff-browser:scope-runtime-1"
+    assert activity.runner_epoch == "epoch-1"
+    assert activity.activity_id not in json.dumps(result)
