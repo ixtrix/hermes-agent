@@ -3147,6 +3147,9 @@ describe('usePromptActions file attachment sync', () => {
     '@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`:1-3',
     '  @file:   "/Users/mahmoud/Downloads/DEVIS_signed.pdf" :1-3  ',
     '@file:"/Users/alice/secret.pdf":12,',
+    '@file:("/Users/a/secret.pdf")',
+    '@file:["/Users/a/secret.pdf"]',
+    '@file:<"/Users/a/secret.pdf">',
     '@file://server/share',
     '@file:"C:\\Users\\alice\\Downloads\\DEVIS_signed.pdf":12',
     '@file:"\\Users\\alice\\Downloads\\DEVIS_signed.pdf"'

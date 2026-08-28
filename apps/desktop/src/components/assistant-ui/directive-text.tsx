@@ -242,11 +242,19 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
     ...Array.from(text.matchAll(HERMES_DIRECTIVE_RE)).map(match => {
       const parsed = parseReference(match[0])
       const type = parsed?.kind || match[1] || 'file'
-      const baseId = parsed?.value || unwrapRefValue(match[2] || '')
+      const wireValue = match[2] || ''
+      const baseId = parsed?.value || unwrapRefValue(wireValue)
       const targetId = parsed?.lineRange ? `${baseId}:${parsed.lineRange}` : baseId
-      const id =
-        parsed?.quoted && parsed.lineRange ? `@${type}:${formatRefValue(baseId)}:${parsed.lineRange}` : targetId
-
+      const normalizedReference = `@${type}:${formatRefValue(baseId)}${parsed?.lineRange ? `:${parsed.lineRange}` : ''}`
+      const normalizedParsed = parsed?.quoted ? parseReference(normalizedReference) : null
+      const quotedSyntaxIsSemantic =
+        parsed?.quoted &&
+        (Boolean(parsed.lineRange) ||
+          normalizedParsed?.value !== baseId ||
+          normalizedParsed?.lineRange !== parsed.lineRange)
+      const id = quotedSyntaxIsSemantic
+        ? `@${type}:${wireValue}${parsed.lineRange ? `:${parsed.lineRange}` : ''}`
+        : targetId
       return {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,

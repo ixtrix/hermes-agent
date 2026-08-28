@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { formatRefValue, hermesDirectiveFormatter } from './directive-text'
+import { parseReference } from './reference-kinds'
 
 describe('formatRefValue', () => {
   it('leaves simple paths untouched', () => {
@@ -39,6 +40,27 @@ describe('hermesDirectiveFormatter.parse', () => {
     ])
   })
 
+  it('roundtrips a quoted colon-digits filename without inventing a line range', () => {
+    const wireReference = '@file:"reports/report:12"'
+    const [segment] = hermesDirectiveFormatter.parse(wireReference)
+
+    expect(segment).toEqual({
+      kind: 'mention',
+      type: 'file',
+      label: 'reports/report:12',
+      id: wireReference
+    })
+
+    const serialized = segment.kind === 'mention' ? hermesDirectiveFormatter.serialize(segment) : ''
+    expect(serialized).toBe(wireReference)
+    expect(parseReference(serialized)).toEqual({
+      kind: 'file',
+      quoted: true,
+      value: 'reports/report:12'
+    })
+    expect(hermesDirectiveFormatter.parse(serialized)).toEqual([segment])
+  })
+
   it('keeps a file line range in the chip target and serialized reference', () => {
     const [segment] = hermesDirectiveFormatter.parse('@file:src/a.ts:12')
 
@@ -50,20 +72,26 @@ describe('hermesDirectiveFormatter.parse', () => {
     ).toBe('@file:src/a.ts:12')
   })
 
-  it('serializes a quoted file line range after the closing quote', () => {
-    const [segment] = hermesDirectiveFormatter.parse('@file:`src/my notes.ts`:12')
+  it('roundtrips a real range without folding it into a colon-digits filename', () => {
+    const wireReference = '@file:"reports/report:12":34'
+    const [segment] = hermesDirectiveFormatter.parse(wireReference)
 
-    expect(segment).toEqual(
-      expect.objectContaining({
-        kind: 'mention',
-        type: 'file',
-        label: 'src/my notes.ts:12',
-        id: '@file:`src/my notes.ts`:12'
-      })
-    )
-    expect(segment.kind === 'mention' ? hermesDirectiveFormatter.serialize(segment) : '').toBe(
-      '@file:`src/my notes.ts`:12'
-    )
+    expect(segment).toEqual({
+      kind: 'mention',
+      type: 'file',
+      label: 'reports/report:12:34',
+      id: wireReference
+    })
+
+    const serialized = segment.kind === 'mention' ? hermesDirectiveFormatter.serialize(segment) : ''
+    expect(serialized).toBe(wireReference)
+    expect(parseReference(serialized)).toEqual({
+      kind: 'file',
+      lineRange: '34',
+      quoted: true,
+      value: 'reports/report:12'
+    })
+    expect(hermesDirectiveFormatter.parse(serialized)).toEqual([segment])
   })
 
   it('parses session links with profile/id values', () => {
