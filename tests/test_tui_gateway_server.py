@@ -10463,6 +10463,41 @@ def test_file_attach_with_real_session_create_and_cli_resolution(monkeypatch, tm
         server._sessions.pop(sid, None)
 
 
+@pytest.mark.require_symlinks
+@pytest.mark.skipif(os.name == "nt", reason="POSIX session cwd alias behavior")
+def test_file_attach_symlinked_session_cwd_keeps_relative_ref(monkeypatch, tmp_path):
+    """Keep a canonical staging path relative when the cwd is an alias."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+    server._sessions["sid"] = _session(cwd=str(alias))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,YWxpYXMgYnl0ZXM=",
+                },
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["ref_text"] == (
+            "@file:.hermes/desktop-attachments/report.txt"
+        )
+        assert str(workspace) not in resp["result"]["ref_text"]
+        assert str(alias) not in resp["result"]["ref_text"]
+        assert stored.read_text(encoding="utf-8") == "alias bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 @pytest.mark.windows_only
 def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
     """Windows uses verified handles for both the workspace source and staged copy."""
@@ -10748,7 +10783,34 @@ def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
         )
 
         assert "error" in resp
-        assert "outside the session workspace" in resp["error"]["message"]
+        assert "not a safe regular file" in resp["error"]["message"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_rejects_in_workspace_source_symlink(monkeypatch, tmp_path):
+    """Reject an alias even when its target remains inside the workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("regular bytes", encoding="utf-8")
+    alias = workspace / "report-alias.txt"
+    alias.symlink_to(source)
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(alias)},
+            }
+        )
+
+        assert "error" in resp
+        assert "not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
     finally:
         server._sessions.pop("sid", None)
 

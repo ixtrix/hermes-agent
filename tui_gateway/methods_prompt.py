@@ -1235,7 +1235,7 @@ def _(rid, params: dict) -> dict:
         stored_path, uploaded = _stage_session_file_attachment(
             session, raw_path=raw, data_url=data_url, name=name
         )
-        ref_path = _attachment_ref_path(session, stored_path)
+        ref_path = _attachment_ref_path(stored_path)
         return _ok(
             rid,
             {

@@ -12,6 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import type { HermesGateway } from '@/hermes'
 import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, userMessage } from '../test-utils'
@@ -40,7 +41,15 @@ async function moveFocusOutside(editor: HTMLElement) {
 }
 
 // Mirrors chat/index.tsx: incremental runtime + messageRepository + onEdit.
-function IncrementalHarness({ onEdit }: { onEdit: (message: AppendMessage) => Promise<void> }) {
+function IncrementalHarness({
+  gateway = null,
+  onEdit,
+  sessionId = null
+}: {
+  gateway?: HermesGateway | null
+  onEdit: (message: AppendMessage) => Promise<void>
+  sessionId?: null | string
+}) {
   const repository = ExportedMessageRepository.fromArray([userMessage(), assistantMessage()])
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
@@ -55,7 +64,7 @@ function IncrementalHarness({ onEdit }: { onEdit: (message: AppendMessage) => Pr
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <Thread />
+      <Thread gateway={gateway} sessionId={sessionId} />
     </AssistantRuntimeProvider>
   )
 }
@@ -219,6 +228,133 @@ describe('click-to-edit user message', () => {
         ])
       )
       expect(editor.textContent).not.toContain('/Users/alice/secret.pdf')
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: previousDesktop })
+    }
+  })
+
+  it('replaces an OS image path with the collision-safe session ref before render and submit', async () => {
+    const previousDesktop = window.hermesDesktop
+    const localPath = '/Users/alice/Pictures/photo.png'
+    const sessionPath = '.hermes/images/photo-2.png'
+    const file = new File(['image bytes'], 'photo.png', { type: 'image/png' })
+    const dataTransfer = {
+      dropEffect: 'none',
+      files: { item: () => file, length: 1 },
+      getData: () => '',
+      items: [
+        {
+          getAsFile: () => file,
+          kind: 'file',
+          webkitGetAsEntry: () => ({ isDirectory: false })
+        }
+      ],
+      types: ['Files']
+    } as unknown as DataTransfer
+    const request = vi.fn(async (method: string) => {
+      if (method === 'image.attach_bytes') {
+        return { attached: true, path: sessionPath }
+      }
+
+      return {}
+    })
+    const onEdit = vi.fn(async (_message: AppendMessage) => {})
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        ...previousDesktop,
+        getPathForFile: () => localPath,
+        readFileDataUrl: async () => 'data:image/png;base64,aW1hZ2UgYnl0ZXM='
+      }
+    })
+
+    try {
+      const { container } = render(
+        <IncrementalHarness gateway={{ request } as unknown as HermesGateway} onEdit={onEdit} sessionId="session-1" />
+      )
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+      const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+
+      fireEvent.drop(editor, { dataTransfer })
+
+      const chip = await waitFor(() => {
+        const node = container.querySelector<HTMLElement>('[data-ref-kind="image"]')
+        expect(node).toBeTruthy()
+
+        return node!
+      })
+      expect(request).toHaveBeenCalledWith('image.attach_bytes', {
+        content_base64: 'aW1hZ2UgYnl0ZXM=',
+        filename: 'photo.png',
+        session_id: 'session-1'
+      })
+      expect(chip.dataset.refId).toBe(sessionPath)
+      expect(chip.dataset.refText).toBe(`@image:\`${sessionPath}\``)
+      expect(editor.innerHTML).not.toContain(localPath)
+
+      fireEvent.keyDown(editor, { key: 'Enter' })
+
+      await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1))
+      const submitted = onEdit.mock.calls[0]![0].content.filter(part => part.type === 'text')
+        .map(part => part.text)
+        .join('')
+      expect(submitted).toContain(sessionPath)
+      expect(submitted).not.toContain(localPath)
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: previousDesktop })
+    }
+  })
+
+  it('fails an OS image drop when the gateway omits the session-owned path', async () => {
+    const previousDesktop = window.hermesDesktop
+    const localPath = '/Users/alice/Pictures/secret.png'
+    const file = new File(['image bytes'], 'secret.png', { type: 'image/png' })
+    const dataTransfer = {
+      dropEffect: 'none',
+      files: { item: () => file, length: 1 },
+      getData: () => '',
+      items: [
+        {
+          getAsFile: () => file,
+          kind: 'file',
+          webkitGetAsEntry: () => ({ isDirectory: false })
+        }
+      ],
+      types: ['Files']
+    } as unknown as DataTransfer
+    const request = vi.fn(async () => ({ attached: true }))
+    const onEdit = vi.fn(async (_message: AppendMessage) => {})
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        ...previousDesktop,
+        getPathForFile: () => localPath,
+        readFileDataUrl: async () => 'data:image/png;base64,aW1hZ2UgYnl0ZXM='
+      }
+    })
+
+    try {
+      const { container } = render(
+        <IncrementalHarness gateway={{ request } as unknown as HermesGateway} onEdit={onEdit} sessionId="session-1" />
+      )
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+      const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+
+      fireEvent.drop(editor, { dataTransfer })
+
+      await waitFor(() =>
+        expect($notifications.get()).toEqual([
+          expect.objectContaining({
+            kind: 'error',
+            message: expect.stringContaining('gateway returned no session-owned image path')
+          })
+        ])
+      )
+      expect(container.querySelector('[data-ref-kind="image"]')).toBeNull()
+      expect(editor.innerHTML).not.toContain(localPath)
+      expect(onEdit).not.toHaveBeenCalled()
     } finally {
       Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: previousDesktop })
     }

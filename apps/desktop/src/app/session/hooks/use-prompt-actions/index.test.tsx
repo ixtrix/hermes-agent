@@ -3179,33 +3179,12 @@ describe('usePromptActions file attachment sync', () => {
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 
-  it.each(['@folder:/Users/alice/project', '@folder:"\\Users\\alice\\project"'])(
-    'rejects a remote pathless absolute folder ref: %s',
-    async refText => {
-      $connection.set({ mode: 'remote' } as never)
-      const requestGateway = vi.fn(async () => ({}) as never)
-      let handle: HarnessHandle | null = null
-      await actRender(
-        <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
-      )
-
-      await expect(
-        handle!.submitText('inspect this folder', {
-          attachments: [
-            {
-              id: `folder:${refText}`,
-              kind: 'folder',
-              label: 'project',
-              refText
-            }
-          ]
-        })
-      ).resolves.toBe(false)
-      expect(requestGateway).not.toHaveBeenCalled()
-    }
-  )
-
-  it('passes a remote pathless workspace-relative folder ref through', async () => {
+  it.each([
+    { path: undefined, refText: '@folder:/Users/alice/project' },
+    { path: undefined, refText: '@folder:"\\Users\\alice\\project"' },
+    { path: '/Users/alice/project', refText: '@folder:project' },
+    { path: '\\Users\\alice\\project', refText: '@folder:project' }
+  ])('rejects a remote absolute folder ref: $path $refText', async ({ path, refText }) => {
     $connection.set({ mode: 'remote' } as never)
     const requestGateway = vi.fn(async () => ({}) as never)
     let handle: HarnessHandle | null = null
@@ -3217,20 +3196,48 @@ describe('usePromptActions file attachment sync', () => {
       handle!.submitText('inspect this folder', {
         attachments: [
           {
-            id: 'folder:workspace-reports',
+            id: `folder:${path || refText}`,
             kind: 'folder',
-            label: 'reports',
-            refText: '@folder:reports/quarterly'
+            label: 'project',
+            path,
+            refText
           }
         ]
       })
-    ).resolves.toBe(true)
-    expect(requestGateway).toHaveBeenCalledWith(
-      'prompt.submit',
-      { session_id: RUNTIME_SESSION_ID, text: '@folder:reports/quarterly\n\ninspect this folder' },
-      expect.anything()
-    )
+    ).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalled()
   })
+
+  it.each([undefined, 'reports/quarterly'])(
+    'passes a remote workspace-relative folder ref through with path %s',
+    async path => {
+      $connection.set({ mode: 'remote' } as never)
+      const requestGateway = vi.fn(async () => ({}) as never)
+      let handle: HarnessHandle | null = null
+      await actRender(
+        <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+      )
+
+      await expect(
+        handle!.submitText('inspect this folder', {
+          attachments: [
+            {
+              id: `folder:workspace-reports:${path || 'pathless'}`,
+              kind: 'folder',
+              label: 'reports',
+              path,
+              refText: '@folder:reports/quarterly'
+            }
+          ]
+        })
+      ).resolves.toBe(true)
+      expect(requestGateway).toHaveBeenCalledWith(
+        'prompt.submit',
+        { session_id: RUNTIME_SESSION_ID, text: '@folder:reports/quarterly\n\ninspect this folder' },
+        expect.anything()
+      )
+    }
+  )
 
   it('passes a remote path-less workspace-relative @file ref through without reading local bytes', async () => {
     $connection.set({ mode: 'remote' } as never)

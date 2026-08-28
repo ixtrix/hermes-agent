@@ -3,6 +3,7 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { parseReference } from '@/components/assistant-ui/reference-kinds'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -28,6 +29,7 @@ import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
+  $connection,
   $messages,
   setActiveSessionId,
   setAwaitingResponse,
@@ -94,7 +96,7 @@ function isAbsoluteDesktopPath(path: string): boolean {
 }
 
 export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachment): void {
-  if (attachment.path || !['file', 'folder', 'image'].includes(attachment.kind)) {
+  if (!['file', 'folder', 'image'].includes(attachment.kind) || (attachment.path && attachment.kind !== 'folder')) {
     return
   }
 
@@ -105,7 +107,11 @@ export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachm
     .replace(/^@(file|folder|image):[^\S\n]*/, '')
     .replace(/^[\s"'`(\[{<]+/, '')
 
-  if ((refPath && isAbsoluteDesktopPath(refPath)) || isAbsoluteDesktopPath(rawRefPath)) {
+  if (
+    (refPath && isAbsoluteDesktopPath(refPath)) ||
+    isAbsoluteDesktopPath(rawRefPath) ||
+    (attachment.kind === 'folder' && attachment.path && isAbsoluteDesktopPath(attachment.path))
+  ) {
     const reason =
       attachment.kind === 'folder'
         ? 'local folder paths are unavailable to this session'
@@ -178,13 +184,22 @@ export async function uploadComposerAttachment(
         throw new Error(result.message || `Could not attach ${label}`)
       }
 
-      const attachedPath = result.path || path
+      // A byte upload crossed the desktop/gateway trust boundary. The response
+      // must name the session-owned copy; falling back to the desktop path
+      // would reintroduce that path into chips, edit drafts, and prompts.
+      const attachedPath = result.path || (uploadBytes ? '' : path)
+
+      if (!attachedPath) {
+        throw new Error(`Could not attach ${label}: gateway returned no session-owned image path`)
+      }
 
       return {
         ...attachment,
         attachedSessionId: liveSessionId,
-        label: attachedPath ? pathLabel(attachedPath) : attachment.label,
+        detail: attachedPath,
+        label: pathLabel(attachedPath),
         path: attachedPath,
+        refText: `@image:${formatRefValue(attachedPath)}`,
         uploadState: undefined
       }
     }
@@ -363,12 +378,14 @@ export function usePromptActions({
           await inFlight
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
-
         // Pathless context refs are valid only when their path namespace is
-        // visible to the gateway. Parse quoting and optional line ranges before
-        // deciding so alternate spellings cannot smuggle a workstation path.
-        if (!attachment.path) {
+        // visible to the gateway. Remote sessions also cannot resolve a
+        // desktop-local folder path because folders have no byte-upload seam.
+        if (!attachment.path || (attachment.kind === 'folder' && $connection.get()?.mode === 'remote')) {
           assertAttachmentCanSubmitWithoutPath(attachment)
+        }
+
+        if (!attachment.path) {
           synced.push(attachment)
           continue
         }

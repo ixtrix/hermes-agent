@@ -22,7 +22,7 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $sessions, sessionMatchesStoredId } from '@/store/session'
+import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $sessionStates, patchSessionTile, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
@@ -189,8 +189,11 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       }
 
       for (const attachment of attachments) {
-        if (!attachment.path) {
+        if (!attachment.path || (attachment.kind === 'folder' && $connection.get()?.mode === 'remote')) {
           assertAttachmentCanSubmitWithoutPath(attachment)
+        }
+
+        if (!attachment.path) {
           synced.push(attachment)
           continue
         }

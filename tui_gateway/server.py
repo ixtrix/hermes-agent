@@ -12479,15 +12479,15 @@ def _format_ref_value(value: str) -> str:
     return value
 
 
-def _attachment_ref_path(session: dict, target: Path) -> str:
-    """Return the trusted lexical workspace-relative name for an attachment."""
-    workspace = Path(os.path.abspath(_session_cwd(session)))
-    absolute_target = Path(os.path.abspath(target))
-    try:
-        rel = absolute_target.relative_to(workspace)
-        return str(rel).replace(os.sep, "/")
-    except ValueError:
-        return str(absolute_target)
+def _attachment_ref_path(target: Path) -> str:
+    """Return the descriptor-staged attachment's fixed workspace-relative ref.
+
+    ``target`` is created below ``.hermes/desktop-attachments`` through the
+    already-open workspace descriptor. Re-resolving the session's lexical cwd
+    here can disagree with that canonical root when the cwd is a symlink alias
+    and would leak an absolute gateway path.
+    """
+    return f".hermes/desktop-attachments/{target.name}"
 
 
 def _windows_path_key(path: Path) -> str:
@@ -12848,39 +12848,59 @@ def _write_unique_attachment(
 
 
 def _resolve_gateway_attachment_path(raw: str) -> Path | None:
-    """Resolve a raw path token to a gateway-visible file, or None."""
+    """Return an existing gateway path without dereferencing any symlink.
+
+    Containment and file type are enforced later through descriptor-relative
+    ``O_NOFOLLOW`` opens. Canonicalizing here would erase the lexical symlink
+    components that policy must reject.
+    """
     if not raw:
         return None
     try:
-        from cli import _detect_file_drop, _resolve_attachment_path, _split_path_input
+        from cli import _split_path_input
     except Exception:
         return None
 
-    if os.name == "nt":
-        from urllib.parse import unquote, urlparse
-        direct = _resolve_attachment_path(raw)
-        if direct is not None:
-            return Path(direct)
-        dropped = _detect_file_drop(raw)
-        if dropped:
-            return Path(dropped["path"])
+    from urllib.parse import unquote, urlparse
 
+    def lexical_candidate(token: str) -> Path | None:
+        token = str(token or "").strip()
+        if not token:
+            return None
+        if len(token) >= 2 and token[0] in {'"', "'"} and token[-1] == token[0]:
+            token = token[1:-1].strip()
+        token = token.replace("\\ ", " ")
+        if not token:
+            return None
 
-        path_token, _remainder = _split_path_input(raw)
-        expanded = path_token
-        if path_token.startswith("file://"):
-            parsed = urlparse(path_token)
-            expanded = unquote(parsed.path or "")
-            if parsed.netloc:
-                expanded = f"//{parsed.netloc}{expanded}"
-            elif (
-                len(expanded) >= 3
-                and expanded[0] == "/"
-                and expanded[1].isalpha()
-                and expanded[2] == ":"
-            ):
-                expanded = expanded[1:]
+        expanded = token
+        if token.startswith("file://"):
+            try:
+                parsed = urlparse(token)
+                expanded = unquote(parsed.path or "")
+                if parsed.netloc and os.name == "nt":
+                    expanded = f"//{parsed.netloc}{expanded}"
+                elif (
+                    os.name == "nt"
+                    and len(expanded) >= 3
+                    and expanded[0] == "/"
+                    and expanded[1].isalpha()
+                    and expanded[2] == ":"
+                ):
+                    expanded = expanded[1:]
+            except Exception:
+                expanded = token
+
         expanded = os.path.expandvars(os.path.expanduser(expanded))
+        if os.name != "nt":
+            normalized = expanded.replace("\\", "/")
+            if (
+                len(normalized) >= 3
+                and normalized[0].isalpha()
+                and normalized[1:3] == ":/"
+            ):
+                expanded = f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
+
         candidate = Path(expanded)
         if not candidate.is_absolute():
             candidate = Path(os.getenv("TERMINAL_CWD", os.getcwd())) / candidate
@@ -12891,12 +12911,14 @@ def _resolve_gateway_attachment_path(raw: str) -> Path | None:
             return None
         return candidate
 
-    dropped = _detect_file_drop(raw)
-    if dropped:
-        return Path(dropped["path"]).resolve()
+    # Preserve the CLI's useful exact-path-first behavior for unquoted paths
+    # containing spaces, then fall back to its leading-token grammar when the
+    # input also carries trailing prompt text.
+    direct = lexical_candidate(raw)
+    if direct is not None:
+        return direct
     path_token, _remainder = _split_path_input(raw)
-    resolved = _resolve_attachment_path(path_token)
-    return Path(resolved).resolve() if resolved is not None else None
+    return lexical_candidate(path_token)
 
 
 def _decode_attachment_data_url(data_url: str) -> bytes:
