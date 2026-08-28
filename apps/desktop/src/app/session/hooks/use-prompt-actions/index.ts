@@ -141,6 +141,7 @@ export function assertManagedAttachmentStateCoherent(attachment: ComposerAttachm
 
   if (
     !path ||
+    attachment.detail !== path ||
     !ref ||
     ref.kind !== attachment.kind ||
     ref.value !== path ||

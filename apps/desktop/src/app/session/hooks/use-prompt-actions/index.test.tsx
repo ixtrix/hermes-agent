@@ -2840,11 +2840,27 @@ describe('usePromptActions file attachment sync', () => {
         attachments: [
           {
             attachedSessionId: RUNTIME_SESSION_ID,
+            detail: 'data/report.txt',
             id: 'file:data/report.txt',
             kind: 'file',
             label: 'report.txt',
             path: 'data/report.txt',
             refText: '@file:`/Users/alice/Downloads/report.txt`'
+          }
+        ]
+      })
+    ).resolves.toBe(false)
+    await expect(
+      handle!.submitText('review this', {
+        attachments: [
+          {
+            attachedSessionId: RUNTIME_SESSION_ID,
+            detail: '/Users/alice/Downloads/report.txt',
+            id: 'file:data/report.txt',
+            kind: 'file',
+            label: 'report.txt',
+            path: 'data/report.txt',
+            refText: '@file:data/report.txt'
           }
         ]
       })
