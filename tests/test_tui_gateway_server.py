@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -10785,6 +10786,79 @@ def test_file_attach_rejects_symlink_swap_after_workspace_resolution(
         assert "error" in resp
         assert "changed or is not a safe regular file" in resp["error"]["message"]
         assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX no-follow file descriptors")
+def test_file_attach_rejects_workspace_fifo_without_blocking(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fifo = workspace / "pending.csv"
+    os.mkfifo(fifo)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: fifo
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(fifo)},
+            }
+        )
+
+        assert "error" in resp
+        assert "not a regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX no-follow directory descriptors")
+def test_file_attach_response_keeps_trusted_name_after_staging_dir_swap(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    real_open = server._open_desktop_attachment_dir
+
+    @contextlib.contextmanager
+    def swap_after_close(session):
+        with real_open(session) as opened:
+            yield opened
+        hermes_dir = workspace / ".hermes"
+        hermes_dir.rename(workspace / ".hermes-written")
+        hermes_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(server, "_open_desktop_attachment_dir", swap_after_close)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2FmZQ==",
+                },
+            }
+        )
+
+        expected = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        assert resp["result"]["path"] == str(expected)
+        assert resp["result"]["ref_text"] == (
+            "@file:.hermes/desktop-attachments/report.txt"
+        )
+        assert list(outside.iterdir()) == []
     finally:
         server._sessions.pop("sid", None)
 

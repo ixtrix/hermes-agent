@@ -12480,13 +12480,14 @@ def _format_ref_value(value: str) -> str:
 
 
 def _attachment_ref_path(session: dict, target: Path) -> str:
-    """Workspace-relative path for an attachment, or the absolute path if outside."""
-    workspace = Path(_session_cwd(session)).resolve()
+    """Return the trusted lexical workspace-relative name for an attachment."""
+    workspace = Path(os.path.abspath(_session_cwd(session)))
+    absolute_target = Path(os.path.abspath(target))
     try:
-        rel = target.resolve().relative_to(workspace)
+        rel = absolute_target.relative_to(workspace)
         return str(rel).replace(os.sep, "/")
     except ValueError:
-        return str(target.resolve())
+        return str(absolute_target)
 
 
 def _windows_path_key(path: Path) -> str:
@@ -12770,7 +12771,7 @@ def _open_workspace_attachment_no_follow(workspace: Path, resolved: Path):
 
         file_fd = os.open(
             relative.parts[-1],
-            os.O_RDONLY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
             dir_fd=current_fd,
         )
         if not _stat.S_ISREG(os.fstat(file_fd).st_mode):
@@ -12957,7 +12958,7 @@ def _stage_session_file_attachment(
                 _sanitize_attachment_name(filename),
                 payload=payload,
             )
-        return target.resolve(), True
+        return target, True
 
     resolved = _resolve_gateway_attachment_path(raw_path)
     if resolved is None:
@@ -12976,7 +12977,7 @@ def _stage_session_file_attachment(
                 filename,
                 source=source,
             )
-    return target.resolve(), False
+    return target, False
 
 
 # ── Methods: respond ─────────────────────────────────────────────────

@@ -145,7 +145,9 @@ export const WIRE_REFERENCE_KINDS = ['file', 'folder', 'url', 'image', 'tool', '
  * would end at the first space and strand the rest as prose.
  */
 const REFERENCE_PATTERN =
-  /@(file|folder|url|image|tool|line|terminal|session):[^\S\n]*(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+?)(?:[^\S\n]*:(\d+(?:-\d+)?))?(?=$|\s)/
+  /@(file|folder|url|image|tool|line|terminal|session):[^\S\n]*(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+?)(?:[^\S\n]*:(\d+(?:-\d+)?))?(?=$|\s|(?<=["'`]|\d)[,.;!?)}\]])/
+
+const REFERENCE_TRAILING_PUNCTUATION_RE = /[,.;!?]+$/
 
 export interface ParsedReference {
   kind: (typeof WIRE_REFERENCE_KINDS)[number]
@@ -156,7 +158,8 @@ export interface ParsedReference {
 
 /** Parse one complete wire reference using the same grammar rendered by chips. */
 export function parseReference(text: string): ParsedReference | null {
-  const match = new RegExp(`^(?:${REFERENCE_PATTERN.source})$`).exec(text.trim())
+  const candidate = text.trim().replace(REFERENCE_TRAILING_PUNCTUATION_RE, '')
+  const match = new RegExp(`^(?:${REFERENCE_PATTERN.source})$`).exec(candidate)
 
   if (!match) {
     return null

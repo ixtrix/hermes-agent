@@ -62,6 +62,19 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(screen.queryByTitle('src/my notes.ts:12')).not.toBeNull()
   })
 
+  it('keeps a quoted file range when sentence punctuation follows it', () => {
+    expect(parseReference('@file:"/Users/alice/secret file.pdf":12,')).toEqual({
+      kind: 'file',
+      lineRange: '12',
+      quoted: true,
+      value: '/Users/alice/secret file.pdf'
+    })
+
+    render(<UserMessageText text='open @file:"/Users/alice/secret file.pdf":12, then summarize it' />)
+
+    expect(screen.queryByTitle('/Users/alice/secret file.pdf:12')).not.toBeNull()
+  })
+
   it('chips a backtick-quoted @file: path with spaces', () => {
     render(<UserMessageText text="see @file:`apps/desktop/my notes.md` please" />)
 

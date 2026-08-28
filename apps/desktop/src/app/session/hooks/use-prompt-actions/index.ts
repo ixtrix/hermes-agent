@@ -98,9 +98,14 @@ export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachm
     return
   }
 
-  const refPath = parseReference(attachment.refText || '')?.value || ''
+  const refText = attachment.refText || ''
+  const refPath = parseReference(refText)?.value || ''
+  const rawRefPath = refText
+    .trim()
+    .replace(/^@(file|image):[^\S\n]*/, '')
+    .replace(/^[`"']/, '')
 
-  if (refPath && isAbsoluteDesktopPath(refPath)) {
+  if ((refPath && isAbsoluteDesktopPath(refPath)) || isAbsoluteDesktopPath(rawRefPath)) {
     throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
   }
 }
