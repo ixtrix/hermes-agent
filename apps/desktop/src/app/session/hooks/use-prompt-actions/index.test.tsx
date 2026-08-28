@@ -2794,6 +2794,64 @@ describe('usePromptActions file attachment sync', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it('rejects restaging a workspace-relative file in another session without authoritative desktop bytes', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          ref_text: '@file:.hermes/desktop-attachments/session-a-report.txt',
+          uploaded: false
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const first = await uploadComposerAttachment(
+      {
+        id: 'file:data/report.txt',
+        kind: 'file',
+        label: 'report.txt',
+        path: 'data/report.txt',
+        refText: '@file:data/report.txt'
+      },
+      { requestGateway, sessionId: 'runtime-a' }
+    )
+
+    expect(first.sourcePath).toBeUndefined()
+    await expect(
+      uploadComposerAttachment(first, {
+        requestGateway,
+        sessionId: 'runtime-b'
+      })
+    ).rejects.toThrow('session-owned file ref has no authoritative source')
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects incoherent staged attachment state before a same-session submit', async () => {
+    const requestGateway = vi.fn()
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await expect(
+      handle!.submitText('review this', {
+        attachments: [
+          {
+            attachedSessionId: RUNTIME_SESSION_ID,
+            id: 'file:data/report.txt',
+            kind: 'file',
+            label: 'report.txt',
+            path: 'data/report.txt',
+            refText: '@file:`/Users/alice/Downloads/report.txt`'
+          }
+        ]
+      })
+    ).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
   it('uploads an absolute POSIX file in local mode instead of passing an outside-workspace path', async () => {
     $connection.set({ mode: 'local' } as never)
     $currentCwd.set('/Users/alice/project')

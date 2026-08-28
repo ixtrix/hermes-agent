@@ -12868,6 +12868,17 @@ def _sanitize_attachment_name(name: str) -> str:
     return candidate or "attachment"
 
 
+def _session_attachment_name(session: dict, filename: str) -> str:
+    import secrets
+
+    token = session.get("_desktop_attachment_ref_token")
+    if not token:
+        token = secrets.token_hex(16)
+        session["_desktop_attachment_ref_token"] = token
+    path = Path(filename)
+    return f"{token}-{path.stem or 'attachment'}{path.suffix}"
+
+
 def _open_workspace_attachment_no_follow(observed: _ObservedAttachmentPath):
     """Open the exact observed workspace file without following replacements."""
     import stat as _stat
@@ -13141,7 +13152,9 @@ def _stage_session_file_attachment(
                     attachment_workspace,
                     upload_dir,
                     upload_dir_fd,
-                    _sanitize_attachment_name(filename),
+                    _session_attachment_name(
+                        session, _sanitize_attachment_name(filename)
+                    ),
                     reserved_names={Path(key).name for key in registry},
                     payload=payload,
                     source=source,

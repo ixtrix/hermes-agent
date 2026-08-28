@@ -4483,6 +4483,7 @@ def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
         "session_key": "session-key",
+        "_desktop_attachment_ref_token": "test",
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -10410,11 +10411,11 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.txt"
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.txt"
+        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report.txt"
         assert not (home / "attachments").exists()
         assert stored.read_text(encoding="utf-8") == "hello world"
     finally:
@@ -10451,12 +10452,12 @@ def test_file_attach_with_real_session_create_and_cli_resolution(monkeypatch, tm
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        ref_path = resp["result"]["path"]
+        stored = workspace / ref_path
         assert created["result"]["info"]["cwd"] == str(workspace)
-        assert (
-            resp["result"]["ref_text"]
-            == "@file:.hermes/desktop-attachments/report.txt"
-        )
+        assert ref_path.startswith(".hermes/desktop-attachments/")
+        assert ref_path.endswith("-report.txt")
+        assert resp["result"]["ref_text"] == f"@file:{ref_path}"
         assert resp["result"]["uploaded"] is False
         assert stored.read_text(encoding="utf-8") == "real session bytes"
     finally:
@@ -10486,10 +10487,10 @@ def test_file_attach_symlinked_session_cwd_keeps_relative_ref(monkeypatch, tmp_p
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
-        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.txt"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.txt"
         assert resp["result"]["ref_text"] == (
-            "@file:.hermes/desktop-attachments/report.txt"
+            "@file:.hermes/desktop-attachments/test-report.txt"
         )
         assert str(workspace) not in resp["result"]["ref_text"]
         assert str(alias) not in resp["result"]["ref_text"]
@@ -10551,8 +10552,8 @@ def test_file_attach_resolves_relative_path_from_session_workspace(
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.csv"
-        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.csv"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.csv"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.csv"
         assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
     finally:
         server._sessions.pop("sid", None)
@@ -10675,9 +10676,9 @@ def test_file_attach_uploaded_pdf_becomes_model_context(monkeypatch, tmp_path):
             ),
         )
 
-        assert ref_text == "@file:.hermes/desktop-attachments/harmless.pdf"
+        assert ref_text == "@file:.hermes/desktop-attachments/test-harmless.pdf"
         assert resp["result"]["path"] == (
-            ".hermes/desktop-attachments/harmless.pdf"
+            ".hermes/desktop-attachments/test-harmless.pdf"
         )
         assert str(workspace) not in resp["result"]["path"]
         assert context.warnings == []
@@ -10737,13 +10738,13 @@ def test_file_attach_prompt_rejects_in_workspace_store_replacement(
             ),
         )
 
-        assert ref_text == "@file:.hermes/desktop-attachments/report.txt"
+        assert ref_text == "@file:.hermes/desktop-attachments/test-report.txt"
         assert "preexisting attacker bytes" not in context.message
         assert "safe staged bytes" not in context.message
         assert context.warnings
         assert "changed or is not a safe regular file" in context.warnings[0]
         assert (
-            staged_store / "desktop-attachments" / "report.txt"
+            staged_store / "desktop-attachments" / "test-report.txt"
         ).read_text(encoding="utf-8") == "safe staged bytes"
     finally:
         server._sessions.pop("sid", None)
@@ -10782,7 +10783,7 @@ def test_file_attach_registered_ref_preprocesses_exact_staged_bytes(tmp_path):
         assert context.warnings == []
         assert "exact staged bytes" in context.message
         assert (
-            workspace / ".hermes" / "desktop-attachments" / "report.txt"
+            workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
         ).read_bytes() == b"exact staged bytes"
     finally:
         server._sessions.pop("sid", None)
@@ -10821,8 +10822,8 @@ def test_file_attach_never_rebinds_deleted_registered_ref(tmp_path):
             }
         )
 
-        assert first["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
-        assert second["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report-2.txt"
+        assert first["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report.txt"
+        assert second["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report-2.txt"
 
         old_context = preprocess_context_references(
             f"Review {first['result']['ref_text']}",
@@ -10849,6 +10850,83 @@ def test_file_attach_never_rebinds_deleted_registered_ref(tmp_path):
         assert "second bytes" in new_context.message
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_file_attach_never_reuses_deleted_ref_across_sessions(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_a = _session(
+        cwd=str(workspace), _desktop_attachment_ref_token="session-a"
+    )
+    server._sessions["sid-a"] = session_a
+
+    try:
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid-a",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c3RhbGUgYSBieXRlcw==",
+                },
+            }
+        )
+        (workspace / first["result"]["path"]).unlink()
+        server._sessions.pop("sid-a", None)
+
+        session_b = _session(
+            cwd=str(workspace), _desktop_attachment_ref_token="session-b"
+        )
+        server._sessions["sid-b"] = session_b
+        second = server.handle_request(
+            {
+                "id": "2",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid-b",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,bmV3IGIgYnl0ZXM=",
+                },
+            }
+        )
+
+        assert first["result"]["ref_text"] != second["result"]["ref_text"]
+        assert first["result"]["ref_text"].endswith(
+            "/session-a-report.txt"
+        )
+        assert second["result"]["ref_text"].endswith(
+            "/session-b-report.txt"
+        )
+
+        old_context = preprocess_context_references(
+            f"Review {first['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session_b, target
+            ),
+        )
+        new_context = preprocess_context_references(
+            f"Review {second['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session_b, target
+            ),
+        )
+
+        assert old_context.warnings
+        assert "new b bytes" not in old_context.message
+        assert new_context.warnings == []
+        assert "new b bytes" in new_context.message
+    finally:
+        server._sessions.pop("sid-a", None)
+        server._sessions.pop("sid-b", None)
 
 
 def test_file_attach_registered_ref_rejects_in_place_byte_mutation(tmp_path):
@@ -10981,6 +11059,51 @@ def test_file_attach_symlink_alias_to_unregistered_reserved_ref_fails_closed(
     assert "not registered for this session" in context.warnings[0]
 
 
+def test_folder_reference_cannot_list_reserved_attachment_namespace(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    (reserved / "secret.pdf").write_bytes(b"secret")
+
+    for target in (".hermes/desktop-attachments", str(reserved)):
+        context = preprocess_context_references(
+            f"Review @folder:{target}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+        )
+
+        assert "secret.pdf" not in context.message
+        assert context.warnings
+        assert "attachment namespace cannot be listed" in context.warnings[0]
+
+
+@pytest.mark.macos_only
+def test_folder_reference_symlink_alias_to_reserved_namespace_fails_closed(
+    tmp_path,
+):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    (reserved / "secret.pdf").write_bytes(b"secret")
+    (workspace / "attachment-alias").symlink_to(reserved, target_is_directory=True)
+
+    context = preprocess_context_references(
+        "Review @folder:attachment-alias",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert "secret.pdf" not in context.message
+    assert context.warnings
+    assert "attachment namespace cannot be listed" in context.warnings[0]
+
+
 def test_file_attach_registry_loss_after_restart_fails_closed(tmp_path):
     from agent.context_references import preprocess_context_references
 
@@ -11060,7 +11183,7 @@ def test_file_attach_range_shaped_name_remains_preprocessable(
             ),
         )
 
-        assert ref_text == f"@file:.hermes/desktop-attachments/{stored_name}"
+        assert ref_text == f"@file:.hermes/desktop-attachments/test-{stored_name}"
         assert context.warnings == []
         assert context.expanded is True
         assert "range safe content" in context.message
@@ -11097,9 +11220,9 @@ def test_file_attach_uploaded_bytes_win_over_gateway_path_collision(monkeypatch,
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "client-report.txt"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-client-report.txt"
         assert resp["result"]["path"] == (
-            ".hermes/desktop-attachments/client-report.txt"
+            ".hermes/desktop-attachments/test-client-report.txt"
         )
         assert resp["result"]["uploaded"] is True
         assert stored.read_text(encoding="utf-8") == "client bytes"
@@ -11370,7 +11493,7 @@ def test_file_attach_response_keeps_trusted_name_after_staging_dir_swap(
 
         assert "error" in resp
         assert "changed or is not a safe regular file" in resp["error"]["message"]
-        assert ".hermes/desktop-attachments/report.txt" not in server._sessions[
+        assert ".hermes/desktop-attachments/test-report.txt" not in server._sessions[
             "sid"
         ].get("_trusted_file_attachments", {})
         assert list(outside.iterdir()) == []
@@ -11402,11 +11525,11 @@ def test_file_attach_snapshots_in_workspace_file_with_no_follow(monkeypatch, tmp
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "exam.csv"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-exam.csv"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
-        assert resp["result"]["path"] == ".hermes/desktop-attachments/exam.csv"
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/exam.csv"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-exam.csv"
+        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-exam.csv"
         assert stored.read_text(encoding="utf-8") == "a,b,c\n1,2,3\n"
     finally:
         server._sessions.pop("sid", None)
@@ -11471,12 +11594,12 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
             workspace
             / ".hermes"
             / "desktop-attachments"
-            / "my exam schedule.csv"
+            / "test-my exam schedule.csv"
         )
         assert resp["result"]["attached"] is True
         assert (
             resp["result"]["ref_text"]
-            == "@file:`.hermes/desktop-attachments/my exam schedule.csv`"
+            == "@file:`.hermes/desktop-attachments/test-my exam schedule.csv`"
         )
         assert stored.read_text(encoding="utf-8") == "a,b\n"
     finally:

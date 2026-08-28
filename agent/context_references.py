@@ -408,16 +408,10 @@ def _expand_file_reference(
         )
 
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
-    attachment_root = (cwd.resolve() / _SESSION_ATTACHMENT_REF_ROOT).resolve()
-    try:
-        path.relative_to(attachment_root)
-    except ValueError:
-        pass
-    else:
+    if _is_session_attachment_path(path, cwd):
         raise ValueError(
             "session-owned attachment reference is not registered for this session"
         )
-
     _ensure_reference_path_allowed(path)
 
     if not path.exists():
@@ -454,7 +448,11 @@ def _expand_folder_reference(
     *,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    if _is_session_attachment_ref(ref.target):
+        raise ValueError("session-owned attachment namespace cannot be listed")
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
+    if _is_session_attachment_path(path, cwd):
+        raise ValueError("session-owned attachment namespace cannot be listed")
     _ensure_reference_path_allowed(path)
     if not path.exists():
         return f"{ref.raw}: folder not found", None
@@ -625,6 +623,15 @@ def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None
 
     return _strip_reference_wrappers(value), None, None
 
+
+
+def _is_session_attachment_path(path: Path, cwd: Path) -> bool:
+    attachment_root = (cwd.resolve() / _SESSION_ATTACHMENT_REF_ROOT).resolve()
+    try:
+        path.relative_to(attachment_root)
+    except ValueError:
+        return False
+    return True
 
 def _is_session_attachment_ref(target: str) -> bool:
     lexical = str(target).replace("\\", "/")

@@ -126,6 +126,32 @@ export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachm
   }
 }
 
+export function assertManagedAttachmentStateCoherent(attachment: ComposerAttachment): void {
+  if (!attachment.attachedSessionId || (attachment.kind !== 'file' && attachment.kind !== 'image')) {
+    return
+  }
+
+  const path = attachment.path || ''
+  const refText = attachment.refText || ''
+  const ref = parseReference(refText)
+  const rawRefPath = refText
+    .trim()
+    .replace(/^@(file|image):[^\S\n]*/, '')
+    .replace(/^[\s"'`(\[{<]+/, '')
+
+  if (
+    !path ||
+    !ref ||
+    ref.kind !== attachment.kind ||
+    ref.value !== path ||
+    isAbsoluteDesktopPath(path) ||
+    isAbsoluteDesktopPath(ref.value) ||
+    isAbsoluteDesktopPath(rawRefPath)
+  ) {
+    throw new Error(`Could not attach ${attachment.label || pathLabel(path)}: attachment state is inconsistent`)
+  }
+}
+
 /**
  * Stage one file/image attachment into the session workspace and return the
  * attachment rewritten with the gateway-side ref. Absolute desktop paths send
@@ -239,10 +265,10 @@ export async function uploadComposerAttachment(
       ...attachment,
       attachedSessionId: liveSessionId,
       detail: attachedPath,
-      label: pathLabel(attachedPath),
+      label,
       path: attachedPath,
       refText: result.ref_text,
-      sourcePath: attachment.sourcePath || path,
+      sourcePath: fileDataUrl ? attachment.sourcePath || path : attachment.sourcePath,
       uploadState: undefined
     }
   }
@@ -407,6 +433,7 @@ export function usePromptActions({
         // to the gateway. Folders have no byte-upload seam, so validate every
         // folder in every connection mode before it can reach prompt.submit.
         assertAttachmentCanSubmitWithoutPath(attachment)
+        assertManagedAttachmentStateCoherent(attachment)
 
         if (!attachment.path) {
           synced.push(attachment)

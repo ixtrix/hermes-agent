@@ -31,7 +31,11 @@ import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { GatewayRequester } from '../contrib/types'
-import { assertAttachmentCanSubmitWithoutPath, uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
+import {
+  assertAttachmentCanSubmitWithoutPath,
+  assertManagedAttachmentStateCoherent,
+  uploadComposerAttachment
+} from '../session/hooks/use-prompt-actions'
 import {
   appendMidTurnUserMessage,
   applyBranchVisibility,
@@ -190,6 +194,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       for (const attachment of attachments) {
         assertAttachmentCanSubmitWithoutPath(attachment)
+        assertManagedAttachmentStateCoherent(attachment)
 
         if (!attachment.path) {
           synced.push(attachment)
