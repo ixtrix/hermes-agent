@@ -2656,6 +2656,7 @@ describe('usePromptActions file attachment sync', () => {
     $composerAttachments.set([])
     $connection.set(null)
     $currentCwd.set('')
+    $terminalBackend.set('')
     vi.restoreAllMocks()
   })
 
@@ -2706,9 +2707,8 @@ describe('usePromptActions file attachment sync', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['file.attach', 'prompt.submit'])
-    expect(calls[0]?.params).toMatchObject({
+    expect(calls[0]?.params).toEqual({
       session_id: RUNTIME_SESSION_ID,
-      path: '/Users/alice/Downloads/report.txt',
       name: 'report.txt',
       data_url: 'data:text/plain;base64,aGVsbG8='
     })
@@ -2762,7 +2762,6 @@ describe('usePromptActions file attachment sync', () => {
       params: {
         data_url: 'data:text/plain;base64,aGVsbG8=',
         name: 'report.txt',
-        path: 'C:\\Users\\alice\\Downloads\\report.txt',
         session_id: RUNTIME_SESSION_ID
       }
     })
@@ -3049,7 +3048,6 @@ describe('usePromptActions file attachment sync', () => {
       params: {
         data_url: 'data:text/plain;base64,aGVsbG8=',
         name: 'report.txt',
-        path: '/Users/alice/Downloads/report.txt',
         session_id: RUNTIME_SESSION_ID
       }
     })
@@ -3058,16 +3056,7 @@ describe('usePromptActions file attachment sync', () => {
     $terminalBackend.set('')
   })
 
-  it('passes a path-less @file: ref straight through (no path = nothing to upload)', async () => {
-    // Submit-layer contract: only attachments that carry a `path` are upload
-    // candidates. A path-less ref (an @-mention/context ref or pasted text)
-    // has no bytes to send, so syncAttachments leaves it untouched and the ref
-    // reaches the gateway as-is — correct for workspace-relative refs.
-    //
-    // The MahmoudR drag-drop bug (a Finder PDF that became a local-path text
-    // ref in remote mode) is fixed upstream at the DROP layer: OS drops now
-    // carry a path and route through the upload pipeline instead of becoming a
-    // path-less inline ref. See partitionDroppedFiles in use-composer-actions.
+  it('rejects a remote path-less @file ref containing an absolute workstation path', async () => {
     $connection.set({ mode: 'remote' } as never)
     const readFileDataUrl = vi.fn(async () => 'data:application/pdf;base64,JVBERi0=')
     Object.defineProperty(window, 'hermesDesktop', {
@@ -3079,30 +3068,52 @@ describe('usePromptActions file attachment sync', () => {
       id: 'file:devis',
       kind: 'file',
       label: 'DEVIS_signed.pdf',
-      // NOTE: no `path` field — only the pre-baked local @file: ref.
       refText: '@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`'
     }
-
-    const calls: { method: string; params?: Record<string, unknown> }[] = []
-
-    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      calls.push({ method, params })
-
-      return {} as never
-    })
+    const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    const ok = await handle!.submitText('read this file', { attachments: [pathlessRef] })
-
-    expect(ok).toBe(true)
-    // No path → no file.attach, no byte read: the ref passes through unchanged.
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
+    await expect(handle!.submitText('read this file', { attachments: [pathlessRef] })).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalled()
     expect(readFileDataUrl).not.toHaveBeenCalled()
-    expect(calls[0]?.params?.text).toContain('@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`')
+  })
+
+  it('passes a remote path-less workspace-relative @file ref through without reading local bytes', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    const readFileDataUrl = vi.fn(async () => 'data:application/pdf;base64,JVBERi0=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await expect(
+      handle!.submitText('read this file', {
+        attachments: [
+          {
+            id: 'file:workspace-report',
+            kind: 'file',
+            label: 'report.pdf',
+            refText: '@file:reports/report.pdf'
+          }
+        ]
+      })
+    ).resolves.toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: RUNTIME_SESSION_ID, text: '@file:reports/report.pdf\n\nread this file' },
+      expect.anything()
+    )
+    expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 
   it('passes a Windows path directly for a native Windows local backend', async () => {

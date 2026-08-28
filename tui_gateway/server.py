@@ -12578,32 +12578,26 @@ def _stage_session_file_attachment(
 ) -> tuple[Path, bool]:
     """Make a desktop file attachment available to the remote gateway agent.
 
-    Three cases:
-      1. The path resolves to a file already INSIDE the session workspace — use
-         it as-is (no copy, ``uploaded=False``).
-      2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into the session home's ``attachments/`` dir (bind-mounted into
-         container backends) so the ``@file:`` ref resolves inside the sandbox.
-      3. The path doesn't exist on the gateway (the common remote case: it's a
-         path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into the session home's ``attachments/`` dir.
+    Uploaded bytes are authoritative: ``raw_path`` is only a client-side
+    display hint when ``data_url`` is present. Without uploaded bytes, only a
+    gateway-visible regular path contained by the session workspace is
+    accepted. Resolving before containment rejects symlink escapes.
 
     Returns ``(stored_path, uploaded)``.
     """
     workspace = Path(_session_cwd(session)).resolve()
-    resolved = _resolve_gateway_attachment_path(raw_path)
-    if resolved is not None:
-        try:
-            resolved.relative_to(workspace)
-            return resolved, False
-        except ValueError:
-            payload = resolved.read_bytes()
-            filename = resolved.name
-    else:
-        if not data_url:
-            raise ValueError("file not found on gateway and no data_url provided")
+    if data_url:
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
+    else:
+        resolved = _resolve_gateway_attachment_path(raw_path)
+        if resolved is None:
+            raise ValueError("file not found on gateway and no data_url provided")
+        try:
+            resolved.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("gateway file is outside the session workspace") from exc
+        return resolved, False
 
     upload_dir = _desktop_attachment_dir(session)
     target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))

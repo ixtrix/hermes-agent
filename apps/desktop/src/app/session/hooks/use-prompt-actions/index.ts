@@ -110,6 +110,16 @@ function attachmentPathNeedsUpload(path: string, backendCwd?: null | string, ter
   return WINDOWS_ABSOLUTE_PATH_RE.test(path.trim()) && POSIX_ABSOLUTE_PATH_RE.test(backendCwd?.trim() || '')
 }
 
+function attachmentRefHasAbsolutePath(refText?: string): boolean {
+  const raw = (refText || '')
+    .trim()
+    .replace(/^@(?:file|image):/, '')
+    .trim()
+  const path = raw.startsWith('`') && raw.endsWith('`') ? raw.slice(1, -1) : raw
+
+  return WINDOWS_ABSOLUTE_PATH_RE.test(path) || POSIX_ABSOLUTE_PATH_RE.test(path)
+}
+
 /**
  * Stage one file/image attachment into the session workspace and return the
  * attachment rewritten with the gateway-side ref. Attachments upload their
@@ -191,9 +201,8 @@ export async function uploadComposerAttachment(
 
     const result = await requestGateway<FileAttachResponse>('file.attach', {
       name: label,
-      path,
       session_id: liveSessionId,
-      ...(fileDataUrl ? { data_url: fileDataUrl } : {})
+      ...(fileDataUrl ? { data_url: fileDataUrl } : { path })
     })
 
     if (!result.attached || !result.ref_text) {
@@ -366,14 +375,29 @@ export function usePromptActions({
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
 
-        // Already-synced or pathless refs (terminal, url, etc.) pass through.
+        // Pathless context refs are valid only when they are already
+        // workspace-relative. Never forward a workstation-absolute ref to a
+        // remote gateway: it cannot read that namespace, and accepting it
+        // would bypass the uploaded-byte boundary.
+        if (!attachment.path) {
+          if (
+            remote &&
+            (attachment.kind === 'image' || attachment.kind === 'file') &&
+            attachmentRefHasAbsolutePath(attachment.refText)
+          ) {
+            throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
+          }
+
+          synced.push(attachment)
+          continue
+        }
+
         // A drop-time eager upload may already have staged this one (matching
         // attachedSessionId) — don't re-upload it. Compare against the LIVE id:
         // after a mid-loop recovery an earlier chip's attachedSessionId points
         // at the dead runtime and must be re-staged.
-        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
+        if (attachment.attachedSessionId === liveSessionId) {
           synced.push(attachment)
-
           continue
         }
 

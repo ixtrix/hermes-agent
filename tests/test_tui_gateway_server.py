@@ -10407,7 +10407,6 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
                 "method": "file.attach",
                 "params": {
                     "session_id": "sid",
-                    "path": "/Users/alice/Downloads/report.txt",
                     "name": "report.txt",
                     "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
                 },
@@ -10424,8 +10423,44 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         server._sessions.pop("sid", None)
 
 
-def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
-    """Local case: gateway can see the file but it's outside the workspace → copy in."""
+def test_file_attach_uploaded_bytes_win_over_gateway_path_collision(monkeypatch, tmp_path):
+    """Client-uploaded bytes are authoritative even when its display path exists here."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    collision = tmp_path / "report.txt"
+    collision.write_text("gateway bytes", encoding="utf-8")
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: collision
+
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": str(collision),
+                    "name": "client-report.txt",
+                    "data_url": "data:text/plain;base64,Y2xpZW50IGJ5dGVz",
+                },
+            }
+        )
+
+        stored = home / "attachments" / "client-report.txt"
+        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["uploaded"] is True
+        assert stored.read_text(encoding="utf-8") == "client bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "home"
@@ -10448,11 +10483,39 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
             }
         )
 
-        stored = home / "attachments" / "outside.txt"
-        assert resp["result"]["attached"] is True
-        assert resp["result"]["uploaded"] is True
-        assert resp["result"]["ref_text"] == f"@file:{stored}"
-        assert stored.read_text(encoding="utf-8") == "outside workspace"
+        assert "error" in resp
+        assert "outside the session workspace" in resp["error"]["message"]
+        assert not (home / "attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside workspace", encoding="utf-8")
+    link = workspace / "inside-name.txt"
+    link.symlink_to(outside)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: link
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(link)},
+            }
+        )
+
+        assert "error" in resp
+        assert "outside the session workspace" in resp["error"]["message"]
     finally:
         server._sessions.pop("sid", None)
 
