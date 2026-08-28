@@ -94,7 +94,7 @@ function isAbsoluteDesktopPath(path: string): boolean {
 }
 
 export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachment): void {
-  if (attachment.path || (attachment.kind !== 'image' && attachment.kind !== 'file')) {
+  if (attachment.path || !['file', 'folder', 'image'].includes(attachment.kind)) {
     return
   }
 
@@ -102,11 +102,15 @@ export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachm
   const refPath = parseReference(refText)?.value || ''
   const rawRefPath = refText
     .trim()
-    .replace(/^@(file|image):[^\S\n]*/, '')
+    .replace(/^@(file|folder|image):[^\S\n]*/, '')
     .replace(/^[\s"'`(\[{<]+/, '')
 
   if ((refPath && isAbsoluteDesktopPath(refPath)) || isAbsoluteDesktopPath(rawRefPath)) {
-    throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
+    const reason =
+      attachment.kind === 'folder'
+        ? 'local folder paths are unavailable to this session'
+        : 'local file bytes are unavailable'
+    throw new Error(`Could not attach ${attachment.label || 'file'}: ${reason}`)
   }
 }
 

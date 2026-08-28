@@ -348,6 +348,56 @@ describe('session tile attachment occurrence ownership', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it.each(['@folder:/Users/alice/project', '@folder:"\\Users\\alice\\project"'])(
+    'rejects a remote pathless absolute folder ref: %s',
+    async refText => {
+      $connection.set({ mode: 'remote' } as never)
+      const scope = createScope()
+      scope.attachments.add({
+        id: `folder:${refText}`,
+        kind: 'folder',
+        label: 'project',
+        refText
+      })
+      const { result } = renderHook(() =>
+        useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      )
+
+      await act(async () => {
+        await expect(result.current.submitText('inspect this folder')).resolves.toBe(false)
+      })
+
+      expect(requestGateway).not.toHaveBeenCalled()
+    }
+  )
+
+  it('passes a remote pathless workspace-relative folder ref through', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    const scope = createScope()
+    scope.attachments.add({
+      id: 'folder:workspace-reports',
+      kind: 'folder',
+      label: 'reports',
+      refText: '@folder:reports/quarterly'
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('inspect this folder')).resolves.toBe(true)
+    })
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      {
+        session_id: RUNTIME_ID,
+        text: '@folder:reports/quarterly\n\ninspect this folder'
+      },
+      1_000
+    )
+  })
+
   it.each(['docker', 'ssh'])('uploads POSIX host file bytes for a local %s tile backend', async terminalBackend => {
     $terminalBackend.set(terminalBackend)
     const scope = createScope()
