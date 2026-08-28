@@ -161,6 +161,7 @@ export function parseReference(text: string): ParsedReference | null {
     return null
   }
 
+  const kind = match[1] as ParsedReference['kind']
   let value = match[2] || ''
   const quote = value[0]
 
@@ -168,8 +169,11 @@ export function parseReference(text: string): ParsedReference | null {
     value = value.slice(1, -1)
   }
 
-  let lineRange = match[3]
-  if (!lineRange) {
+  let lineRange: string | undefined = match[3]
+  if (lineRange && kind !== 'file') {
+    value = `${value}:${lineRange}`
+    lineRange = undefined
+  } else if (!lineRange && kind === 'file') {
     const bareRange = value.match(/^(.*):(\d+(?:-\d+)?)$/)
 
     if (bareRange) {
@@ -179,7 +183,7 @@ export function parseReference(text: string): ParsedReference | null {
   }
 
   return {
-    kind: match[1] as ParsedReference['kind'],
+    kind,
     ...(lineRange ? { lineRange } : {}),
     value: value.trim()
   }

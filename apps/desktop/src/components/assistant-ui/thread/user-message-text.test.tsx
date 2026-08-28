@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { referenceRe, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
+import { parseReference, referenceRe, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
 
 import { UserMessageText } from './user-message-text'
 
@@ -21,6 +21,19 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(screen.queryByTitle('https://github.com/NousResearch/hermes-agent/pull/74790')).not.toBeNull()
     // The whole reference is one node — no bare `@url:` text left behind.
     expect(document.body.textContent).not.toContain('@url:')
+  })
+
+  it('keeps a numeric URL port instead of parsing it as a line range', () => {
+    expect(parseReference('@url:http://localhost:3000')).toEqual({
+      kind: 'url',
+      value: 'http://localhost:3000'
+    })
+  })
+
+  it('renders a numeric URL port as part of the link chip', () => {
+    render(<UserMessageText text="open @url:http://localhost:3000 now" />)
+
+    expect(screen.queryByTitle('http://localhost:3000')).not.toBeNull()
   })
 
   it('chips a backtick-quoted @file: path with spaces', () => {

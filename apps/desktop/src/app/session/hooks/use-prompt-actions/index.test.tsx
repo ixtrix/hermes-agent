@@ -2718,6 +2718,54 @@ describe('usePromptActions file attachment sync', () => {
     })
   })
 
+  it('uploads an absolute POSIX file in local mode instead of passing an outside-workspace path', async () => {
+    $connection.set({ mode: 'local' } as never)
+    $currentCwd.set('/Users/alice/project')
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          ref_text: '@file:.hermes/desktop-attachments/report.txt',
+          uploaded: true
+        } as never
+      }
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await expect(handle!.submitText('summarize', { attachments: [fileAttachment()] })).resolves.toBe(true)
+    expect(readFileDataUrl).toHaveBeenCalledWith('/Users/alice/Downloads/report.txt')
+    expect(calls).toEqual([
+      {
+        method: 'file.attach',
+        params: {
+          data_url: 'data:text/plain;base64,aGVsbG8=',
+          name: 'report.txt',
+          session_id: RUNTIME_SESSION_ID
+        }
+      },
+      {
+        method: 'prompt.submit',
+        params: {
+          session_id: RUNTIME_SESSION_ID,
+          text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize'
+        }
+      }
+    ])
+  })
+
   it('uploads Windows file bytes when local mode fronts a POSIX WSL/Docker backend', async () => {
     $connection.set({ mode: 'local' } as never)
     $currentCwd.set('/root')

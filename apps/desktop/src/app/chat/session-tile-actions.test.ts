@@ -6,7 +6,7 @@ import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
 const requestGatewayMock = vi.hoisted(() => vi.fn())
 
-const { $activeSessionId } = await import('@/store/session')
+const { $activeSessionId, $connection } = await import('@/store/session')
 const { $sessionTiles, setSessionTileDelegate } = await import('@/store/session-states')
 const { useSessionTileActions } = await import('./session-tile-actions')
 
@@ -59,8 +59,10 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
   afterEach(() => {
     $activeSessionId.set(null)
+    $connection.set(null)
     $sessionTiles.set([])
     requestGatewayMock.mockReset()
+    Reflect.deleteProperty(window, 'hermesDesktop')
     vi.restoreAllMocks()
   })
 
@@ -172,5 +174,62 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
     expect($activeSessionId.get()).toBe('foreground-runtime')
+  })
+
+  it('uploads an absolute POSIX file before submitting from a local-mode tile', async () => {
+    $connection.set({ mode: 'local' } as never)
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,dGlsZQ==')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    requestGatewayMock.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          ref_text: '@file:.hermes/desktop-attachments/report.txt',
+          uploaded: true
+        }
+      }
+      return {}
+    })
+
+    const { result } = renderTileActions()
+    await act(async () => {
+      await expect(
+        result.current.submitText('summarize', {
+          attachments: [
+            {
+              id: 'file:report.txt',
+              kind: 'file',
+              label: 'report.txt',
+              path: '/Users/alice/Downloads/report.txt',
+              refText: '@file:`/Users/alice/Downloads/report.txt`'
+            }
+          ]
+        })
+      ).resolves.toBe(true)
+    })
+
+    expect(readFileDataUrl).toHaveBeenCalledWith('/Users/alice/Downloads/report.txt')
+    expect(calls).toEqual([
+      {
+        method: 'file.attach',
+        params: {
+          data_url: 'data:text/plain;base64,dGlsZQ==',
+          name: 'report.txt',
+          session_id: RUNTIME_SESSION_ID
+        }
+      },
+      {
+        method: 'prompt.submit',
+        params: {
+          session_id: RUNTIME_SESSION_ID,
+          text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize'
+        }
+      }
+    ])
   })
 })

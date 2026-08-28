@@ -10420,6 +10420,39 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         server._sessions.pop("sid", None)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file handles")
+def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
+    """Windows uses verified handles for both the workspace source and staged copy."""
+    workspace = tmp_path / "workspace"
+    source = workspace / "data" / "report.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("sku,qty\nA,2\n", encoding="utf-8")
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "report.csv"
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["uploaded"] is False
+        assert resp["result"]["path"] == str(stored)
+        assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX O_NOFOLLOW semantics")
 def test_file_attach_rejects_symlinked_workspace_staging_directory(
     monkeypatch, tmp_path

@@ -90,14 +90,6 @@ interface HandoffResult {
 
 const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
 const POSIX_ABSOLUTE_PATH_RE = /^\//
-const CONTAINER_TERMINAL_BACKENDS: Record<string, true> = {
-  daytona: true,
-  docker: true,
-  modal: true,
-  singularity: true,
-  ssh: true,
-  vercel_sandbox: true
-}
 
 export interface AttachmentBackendContext {
   backendCwd?: null | string
@@ -105,20 +97,11 @@ export interface AttachmentBackendContext {
   terminalBackend?: string
 }
 
-// `mode: local` means the gateway was launched locally, not necessarily that
-// Electron and the gateway share a filesystem. Container backends and mismatched
-// host/backend path families need bytes. Windows paths always upload because the
-// gateway's race-resistant fallback relies on POSIX dir-fd + O_NOFOLLOW.
-function attachmentPathNeedsUpload(path: string, context: AttachmentBackendContext): boolean {
-  if (
-    context.remote ||
-    CONTAINER_TERMINAL_BACKENDS[(context.terminalBackend || '').trim().toLowerCase()] ||
-    WINDOWS_ABSOLUTE_PATH_RE.test(path.trim())
-  ) {
-    return true
-  }
-
-  return POSIX_ABSOLUTE_PATH_RE.test(path.trim()) && WINDOWS_ABSOLUTE_PATH_RE.test(context.backendCwd?.trim() || '')
+// Absolute paths name files on the desktop host, not a gateway-owned workspace.
+// Always send their bytes; only workspace-relative refs are safe to pass through.
+function attachmentPathNeedsUpload(path: string, _context: AttachmentBackendContext): boolean {
+  const normalized = path.trim()
+  return WINDOWS_ABSOLUTE_PATH_RE.test(normalized) || POSIX_ABSOLUTE_PATH_RE.test(normalized)
 }
 
 export function assertAttachmentCanSubmitWithoutPath(
@@ -143,11 +126,10 @@ export function assertAttachmentCanSubmitWithoutPath(
 
 /**
  * Stage one file/image attachment into the session workspace and return the
- * attachment rewritten with the gateway-side ref. Attachments upload their
- * bytes for remote gateways and local cross-filesystem backends; otherwise the
- * gateway receives the shared local path. Throws on failure so callers can
- * surface an error. Shared by submit-time sync, the eager drop-time upload, and
- * the message-edit composer drop — keep them in lockstep.
+ * attachment rewritten with the gateway-side ref. Absolute desktop paths send
+ * bytes; workspace-relative paths pass through for the gateway to resolve.
+ * Throws on failure so callers can surface an error. Shared by submit-time
+ * sync, eager drop-time upload, and message-edit composer drop.
  */
 export async function uploadComposerAttachment(
   attachment: ComposerAttachment,
