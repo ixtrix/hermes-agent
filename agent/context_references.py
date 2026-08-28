@@ -9,7 +9,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, BinaryIO, Callable
 
 from agent.model_metadata import estimate_tokens_rough
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
@@ -216,6 +216,7 @@ def preprocess_context_references(
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
+    trusted_file_opener: Callable[[str], BinaryIO | None] | None = None,
 ) -> ContextReferenceResult:
     coro = preprocess_context_references_async(
         message,
@@ -223,6 +224,7 @@ def preprocess_context_references(
         context_length=context_length,
         url_fetcher=url_fetcher,
         allowed_root=allowed_root,
+        trusted_file_opener=trusted_file_opener,
     )
     # Safe for both CLI (no loop) and gateway (loop already running).
     try:
@@ -243,6 +245,7 @@ async def preprocess_context_references_async(
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
+    trusted_file_opener: Callable[[str], BinaryIO | None] | None = None,
 ) -> ContextReferenceResult:
     refs = parse_context_references(message)
     if not refs:
@@ -271,6 +274,7 @@ async def preprocess_context_references_async(
                 cwd_path,
                 url_fetcher=url_fetcher,
                 allowed_root=allowed_root_path,
+                trusted_file_opener=trusted_file_opener,
             )
             for ref in refs
         )
@@ -331,10 +335,16 @@ async def _expand_reference(
     *,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: Path | None = None,
+    trusted_file_opener: Callable[[str], BinaryIO | None] | None = None,
 ) -> tuple[str | None, str | None]:
     try:
         if ref.kind == "file":
-            return _expand_file_reference(ref, cwd, allowed_root=allowed_root)
+            return _expand_file_reference(
+                ref,
+                cwd,
+                allowed_root=allowed_root,
+                trusted_file_opener=trusted_file_opener,
+            )
         if ref.kind == "folder":
             return _expand_folder_reference(ref, cwd, allowed_root=allowed_root)
         if ref.kind == "diff":
@@ -370,7 +380,20 @@ def _expand_file_reference(
     cwd: Path,
     *,
     allowed_root: Path | None = None,
+    trusted_file_opener: Callable[[str], BinaryIO | None] | None = None,
 ) -> tuple[str | None, str | None]:
+    path = Path(ref.target)
+    if trusted_file_opener is not None:
+        source = trusted_file_opener(ref.target)
+        if source is not None:
+            with source:
+                size = os.fstat(source.fileno()).st_size
+                sample = source.read(4096)
+                if _is_binary_sample(path, sample):
+                    return None, _binary_reference_block(ref, path, size=size)
+                text = (sample + source.read()).decode("utf-8")
+            return None, _text_reference_block(ref, path, text)
+
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
     if not path.exists():
@@ -387,7 +410,10 @@ def _expand_file_reference(
         # so it can read/convert/view the file itself.
         return None, _binary_reference_block(ref, path)
 
-    text = path.read_text(encoding="utf-8")
+    return None, _text_reference_block(ref, path, path.read_text(encoding="utf-8"))
+
+
+def _text_reference_block(ref: ContextReference, path: Path, text: str) -> str:
     if ref.line_start is not None:
         lines = text.splitlines()
         start_idx = max(ref.line_start - 1, 0)
@@ -395,8 +421,7 @@ def _expand_file_reference(
         text = "\n".join(lines[start_idx:end_idx])
 
     lang = _code_fence_language(path)
-    label = ref.raw
-    return None, f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
+    return f"📄 {ref.raw} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
 
 
 def _expand_folder_reference(
@@ -578,13 +603,16 @@ def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None
 
 
 def _is_binary_file(path: Path) -> bool:
+    return _is_binary_sample(path, path.read_bytes()[:4096])
+
+
+def _is_binary_sample(path: Path, sample: bytes) -> bool:
     mime, _ = mimetypes.guess_type(path.name)
     if mime and not mime.startswith("text/") and not any(
         path.name.endswith(ext) for ext in (".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".js", ".ts")
     ):
         return True
-    chunk = path.read_bytes()[:4096]
-    return b"\x00" in chunk
+    return b"\x00" in sample
 
 
 def _build_folder_listing(path: Path, cwd: Path, limit: int = 200) -> str:
@@ -678,15 +706,20 @@ def _agent_visible_path(path: Path) -> str:
         return str(path)
 
 
-def _binary_reference_block(ref: ContextReference, path: Path) -> str:
+def _binary_reference_block(
+    ref: ContextReference, path: Path, *, size: int | None = None
+) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     mime = mime or "application/octet-stream"
-    try:
-        size = format_bytes(path.stat().st_size)
-    except OSError:
-        size = "unknown size"
+    if size is None:
+        try:
+            size_text = format_bytes(path.stat().st_size)
+        except OSError:
+            size_text = "unknown size"
+    else:
+        size_text = format_bytes(size)
     return (
-        f"📎 {ref.raw} ({mime}, {size}) — binary file, not inlined as text. "
+        f"📎 {ref.raw} ({mime}, {size_text}) — binary file, not inlined as text. "
         f"It is available on disk at `{_agent_visible_path(path)}`. Use your tools to work with it "
         f"(read or convert it, extract its text, or view/render it as needed); "
         f"do not tell the user the file type is unsupported."

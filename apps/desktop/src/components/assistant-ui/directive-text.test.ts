@@ -61,6 +61,27 @@ describe('hermesDirectiveFormatter.parse', () => {
     expect(hermesDirectiveFormatter.parse(serialized)).toEqual([segment])
   })
 
+  it('roundtrips quoted edge spaces as part of the literal file ID', () => {
+    const wireReference = '@file:" reports/report:12 "'
+    const [segment] = hermesDirectiveFormatter.parse(wireReference)
+
+    expect(segment).toEqual({
+      kind: 'mention',
+      type: 'file',
+      label: ' reports/report:12 ',
+      id: wireReference
+    })
+
+    const serialized = segment.kind === 'mention' ? hermesDirectiveFormatter.serialize(segment) : ''
+    expect(serialized).toBe(wireReference)
+    expect(parseReference(serialized)).toEqual({
+      kind: 'file',
+      quoted: true,
+      value: ' reports/report:12 '
+    })
+    expect(hermesDirectiveFormatter.parse(serialized)).toEqual([segment])
+  })
+
   it('keeps a file line range in the chip target and serialized reference', () => {
     const [segment] = hermesDirectiveFormatter.parse('@file:src/a.ts:12')
 

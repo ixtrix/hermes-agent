@@ -10413,7 +10413,7 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.txt"
         assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
         assert not (home / "attachments").exists()
         assert stored.read_text(encoding="utf-8") == "hello world"
@@ -10487,7 +10487,7 @@ def test_file_attach_symlinked_session_cwd_keeps_relative_ref(monkeypatch, tmp_p
         )
 
         stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.txt"
         assert resp["result"]["ref_text"] == (
             "@file:.hermes/desktop-attachments/report.txt"
         )
@@ -10524,7 +10524,7 @@ def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
         stored = workspace / ".hermes" / "desktop-attachments" / "report.csv"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/report.csv"
         assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
     finally:
         server._sessions.pop("sid", None)
@@ -10559,7 +10559,9 @@ def test_file_attach_resolves_unquoted_relative_windows_path_with_spaces(
             / "desktop-attachments"
             / "quarterly report.csv"
         )
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == (
+            ".hermes/desktop-attachments/quarterly report.csv"
+        )
         assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
     finally:
         server._sessions.pop("sid", None)
@@ -10632,14 +10634,79 @@ def test_file_attach_uploaded_pdf_becomes_model_context(monkeypatch, tmp_path):
             cwd=workspace,
             allowed_root=workspace,
             context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                server._sessions["sid"], target
+            ),
         )
 
         assert ref_text == "@file:.hermes/desktop-attachments/harmless.pdf"
+        assert resp["result"]["path"] == (
+            ".hermes/desktop-attachments/harmless.pdf"
+        )
+        assert str(workspace) not in resp["result"]["path"]
         assert context.warnings == []
         assert context.expanded is True
         assert "--- Attached Context ---" in context.message
         assert "application/pdf" in context.message
         assert "binary file, not inlined" in context.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_prompt_rejects_in_workspace_store_replacement(
+    monkeypatch, tmp_path
+):
+    """A redirected relative ref must not consume preexisting workspace bytes."""
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2FmZSBzdGFnZWQgYnl0ZXM=",
+                },
+            }
+        )
+        ref_text = resp["result"]["ref_text"]
+        staged_store = workspace / ".hermes-staged"
+        (workspace / ".hermes").rename(staged_store)
+        redirected_store = workspace / "redirect" / "desktop-attachments"
+        redirected_store.mkdir(parents=True)
+        (redirected_store / "report.txt").write_text(
+            "preexisting attacker bytes", encoding="utf-8"
+        )
+        (workspace / ".hermes").symlink_to(
+            workspace / "redirect", target_is_directory=True
+        )
+
+        context = preprocess_context_references(
+            f"Review {ref_text}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+
+        assert ref_text == "@file:.hermes/desktop-attachments/report.txt"
+        assert "preexisting attacker bytes" not in context.message
+        assert "safe staged bytes" not in context.message
+        assert context.warnings
+        assert "changed or is not a safe regular file" in context.warnings[0]
+        assert (
+            staged_store / "desktop-attachments" / "report.txt"
+        ).read_text(encoding="utf-8") == "safe staged bytes"
     finally:
         server._sessions.pop("sid", None)
 
@@ -10720,7 +10787,9 @@ def test_file_attach_uploaded_bytes_win_over_gateway_path_collision(monkeypatch,
         )
 
         stored = workspace / ".hermes" / "desktop-attachments" / "client-report.txt"
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == (
+            ".hermes/desktop-attachments/client-report.txt"
+        )
         assert resp["result"]["uploaded"] is True
         assert stored.read_text(encoding="utf-8") == "client bytes"
     finally:
@@ -10815,7 +10884,7 @@ def test_file_attach_rejects_in_workspace_source_symlink(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
-@pytest.mark.linux_only
+@pytest.mark.require_symlinks
 def test_file_attach_rejects_symlink_swap_after_workspace_resolution(
     monkeypatch, tmp_path
 ):
@@ -10826,14 +10895,88 @@ def test_file_attach_rejects_symlink_swap_after_workspace_resolution(
     source.write_bytes(b"safe workspace bytes")
     outside = tmp_path / "outside.pdf"
     outside.write_bytes(b"outside bytes")
+    real_resolve = server._resolve_gateway_attachment_path
 
-    def resolve_then_swap(_raw):
-        resolved = source.resolve()
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
         source.unlink()
         source.symlink_to(outside)
-        return resolved
+        return observed
 
     server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_regular_file_swap_after_resolution(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("safe source bytes", encoding="utf-8")
+    replacement = workspace / "replacement.txt"
+    replacement.write_text("replacement bytes", encoding="utf-8")
+    real_resolve = server._resolve_gateway_attachment_path
+
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
+        os.replace(replacement, source)
+        return observed
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_parent_swap_after_resolution(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    source_parent = workspace / "data"
+    source_parent.mkdir(parents=True)
+    source = source_parent / "report.txt"
+    source.write_text("safe source bytes", encoding="utf-8")
+    replacement_parent = workspace / "replacement"
+    replacement_parent.mkdir()
+    (replacement_parent / "report.txt").write_text(
+        "replacement bytes", encoding="utf-8"
+    )
+    real_resolve = server._resolve_gateway_attachment_path
+
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
+        source_parent.rename(workspace / "data-original")
+        replacement_parent.rename(source_parent)
+        return observed
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
     monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
 
     try:
@@ -10875,7 +11018,7 @@ def test_file_attach_rejects_workspace_fifo_without_blocking(monkeypatch, tmp_pa
         )
 
         assert "error" in resp
-        assert "not a regular file" in resp["error"]["message"]
+        assert "not a safe regular file" in resp["error"]["message"]
         assert not (workspace / ".hermes" / "desktop-attachments").exists()
     finally:
         server._sessions.pop("sid", None)
@@ -10915,11 +11058,11 @@ def test_file_attach_response_keeps_trusted_name_after_staging_dir_swap(
             }
         )
 
-        expected = workspace / ".hermes" / "desktop-attachments" / "report.txt"
-        assert resp["result"]["path"] == str(expected)
-        assert resp["result"]["ref_text"] == (
-            "@file:.hermes/desktop-attachments/report.txt"
-        )
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert ".hermes/desktop-attachments/report.txt" not in server._sessions[
+            "sid"
+        ].get("_trusted_file_attachments", {})
         assert list(outside.iterdir()) == []
     finally:
         server._sessions.pop("sid", None)
@@ -10952,7 +11095,7 @@ def test_file_attach_snapshots_in_workspace_file_with_no_follow(monkeypatch, tmp
         stored = workspace / ".hermes" / "desktop-attachments" / "exam.csv"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
-        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/exam.csv"
         assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/exam.csv"
         assert stored.read_text(encoding="utf-8") == "a,b,c\n1,2,3\n"
     finally:
@@ -10976,7 +11119,10 @@ def test_file_attach_errors_when_unresolvable_and_no_bytes(monkeypatch, tmp_path
             {
                 "id": "1",
                 "method": "file.attach",
-                "params": {"session_id": "sid", "path": "/Users/alice/missing.txt"},
+                "params": {
+                    "session_id": "sid",
+                    "path": str(workspace / "missing.txt"),
+                },
             }
         )
 

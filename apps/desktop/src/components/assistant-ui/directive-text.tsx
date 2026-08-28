@@ -249,7 +249,8 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
       const normalizedParsed = parsed?.quoted ? parseReference(normalizedReference) : null
       const quotedSyntaxIsSemantic =
         parsed?.quoted &&
-        (Boolean(parsed.lineRange) ||
+        (baseId !== baseId.trim() ||
+          Boolean(parsed.lineRange) ||
           normalizedParsed?.value !== baseId ||
           normalizedParsed?.lineRange !== parsed.lineRange)
       const id = quotedSyntaxIsSemantic

@@ -191,7 +191,7 @@ export function parseReference(text: string): ParsedReference | null {
     kind,
     ...(quoted ? { quoted: true } : {}),
     ...(lineRange ? { lineRange } : {}),
-    value: value.trim()
+    value: quoted ? value : value.trim()
   }
 }
 
