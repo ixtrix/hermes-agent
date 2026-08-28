@@ -1069,6 +1069,7 @@ def _(rid, params: dict) -> dict:
         {
             "attached": True,
             "path": str(img_path),
+            "ref_path": f"images/{img_path.name}",
             "count": len(session["attached_images"]),
             "remainder": "",
             "text": f"[User attached image: {img_path.name}]",

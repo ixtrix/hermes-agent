@@ -17,6 +17,26 @@ describe('formatRefValue', () => {
     expect(formatRefValue('weird `name` (1).md')).toBe('"weird `name` (1).md"')
   })
 })
+describe('hermesDirectiveFormatter.serialize', () => {
+  it('quotes a completion filename ending in colon-digits', () => {
+    const serialized = hermesDirectiveFormatter.serialize({
+      id: 'reports/report:12',
+      label: 'reports/report:12',
+      metadata: {
+        insertId: 'reports/report:12',
+        rawText: '@file:reports/report:12'
+      },
+      type: 'file'
+    })
+
+    expect(serialized).toBe('@file:`reports/report:12`')
+    expect(parseReference(serialized)).toEqual({
+      kind: 'file',
+      quoted: true,
+      value: 'reports/report:12'
+    })
+  })
+})
 
 describe('hermesDirectiveFormatter.parse', () => {
   it('keeps quoted file paths whole when parsing', () => {

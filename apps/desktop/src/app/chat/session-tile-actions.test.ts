@@ -232,4 +232,27 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
       }
     ])
   })
+
+  it('rejects an absolute folder before local-mode tile submission', async () => {
+    $connection.set({ mode: 'local' } as never)
+    const { result } = renderTileActions()
+
+    await act(async () => {
+      await expect(
+        result.current.submitText('inspect this folder', {
+          attachments: [
+            {
+              id: 'folder:/Users/alice/project',
+              kind: 'folder',
+              label: 'project',
+              path: '/Users/alice/project',
+              refText: '@folder:project'
+            }
+          ]
+        })
+      ).resolves.toBe(false)
+    })
+
+    expect(requestGatewayMock).not.toHaveBeenCalled()
+  })
 })

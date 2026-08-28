@@ -139,7 +139,7 @@ describe('AttachmentList', () => {
     expect(container.querySelector(`img[src="${DATA_URL}"]`)).toBeNull()
   })
 
-  it('falls back to the original host path after an image was staged for a different filesystem', async () => {
+  it('uses the private host source after an image was staged for a different filesystem', async () => {
     const stagedPath = '/root/.hermes/attachments/photo.png'
     const hostPath = 'C:\\Users\\alice\\Pictures\\photo.png'
 
@@ -158,11 +158,12 @@ describe('AttachmentList', () => {
 
     const image: ComposerAttachment = {
       attachedSessionId: 'session-1',
-      detail: hostPath,
+      detail: stagedPath,
       id: 'image:photo.png',
       kind: 'image',
       label: 'photo.png',
       path: stagedPath,
+      sourcePath: hostPath,
       thumbnailUrl: THUMBNAIL_URL
     }
 

@@ -2828,7 +2828,7 @@ describe('usePromptActions file attachment sync', () => {
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'image.attach_bytes') {
-        return { attached: true, path: '/root/tmp/photo.jpg' } as never
+        return { attached: true, path: '/root/tmp/photo.jpg', ref_path: 'images/photo.jpg' } as never
       }
 
       return {} as never
@@ -2854,7 +2854,7 @@ describe('usePromptActions file attachment sync', () => {
       session_id: RUNTIME_SESSION_ID
     })
     expect(requestGateway).not.toHaveBeenCalledWith('image.attach', expect.anything())
-    expect(uploaded.path).toBe('/root/tmp/photo.jpg')
+    expect(uploaded.path).toBe('images/photo.jpg')
   })
   it('uploads Windows root-relative file and image bytes instead of leaking their paths', async () => {
     const readFileDataUrl = vi.fn(async (path: string) =>
@@ -2870,7 +2870,11 @@ describe('usePromptActions file attachment sync', () => {
         return { attached: true, ref_text: '@file:.hermes/desktop-attachments/report.txt' } as never
       }
 
-      return { attached: true, path: '/root/.hermes/desktop-attachments/photo.png' } as never
+      return {
+        attached: true,
+        path: '/root/.hermes/desktop-attachments/photo.png',
+        ref_path: 'images/photo.png'
+      } as never
     })
 
     await uploadComposerAttachment(
@@ -2922,7 +2926,7 @@ describe('usePromptActions file attachment sync', () => {
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'image.attach_bytes') {
-        return { attached: true, path: '/root/tmp/photo.jpg' } as never
+        return { attached: true, path: '/root/tmp/photo.jpg', ref_path: 'images/photo.jpg' } as never
       }
 
       if (method === 'prompt.submit') {
@@ -2940,8 +2944,10 @@ describe('usePromptActions file attachment sync', () => {
     expect(await handle!.submitText('describe this')).toBe(false)
     expect($composerAttachments.get()[0]).toMatchObject({
       attachedSessionId: RUNTIME_SESSION_ID,
+      detail: 'images/photo.jpg',
       occurrenceId: 'occurrence-photo',
-      path: '/root/tmp/photo.jpg',
+      path: 'images/photo.jpg',
+      sourcePath: hostPath,
       thumbnailUrl
     })
   })
@@ -2966,9 +2972,9 @@ describe('usePromptActions file attachment sync', () => {
       occurrenceId: 'occurrence-replacement'
     }
 
-    let resolveAttach!: (value: { attached: boolean; path: string }) => void
+    let resolveAttach!: (value: { attached: boolean; path: string; ref_path: string }) => void
 
-    const attachResult = new Promise<{ attached: boolean; path: string }>(resolve => {
+    const attachResult = new Promise<{ attached: boolean; path: string; ref_path: string }>(resolve => {
       resolveAttach = resolve
     })
 
@@ -2999,7 +3005,7 @@ describe('usePromptActions file attachment sync', () => {
 
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', expect.anything()))
     $composerAttachments.set([replacement])
-    resolveAttach({ attached: true, path: '/root/tmp/photo.jpg' })
+    resolveAttach({ attached: true, path: '/root/tmp/photo.jpg', ref_path: 'images/photo.jpg' })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(true)
@@ -3151,6 +3157,8 @@ describe('usePromptActions file attachment sync', () => {
     '@file:["/Users/a/secret.pdf"]',
     '@file:<"/Users/a/secret.pdf">',
     '@file://server/share',
+    '@file:file:///Users/alice/secret.pdf',
+    '@file:file:///C:/Users/alice/secret.pdf',
     '@file:"C:\\Users\\alice\\Downloads\\DEVIS_signed.pdf":12',
     '@file:"\\Users\\alice\\Downloads\\DEVIS_signed.pdf"'
   ])('rejects a remote pathless absolute workstation ref: %s', async refText => {
@@ -3207,6 +3215,33 @@ describe('usePromptActions file attachment sync', () => {
     ).resolves.toBe(false)
     expect(requestGateway).not.toHaveBeenCalled()
   })
+
+  it.each(['/Users/alice/project', '\\Users\\alice\\project'])(
+    'rejects a local-mode absolute folder path: %s',
+    async path => {
+      $connection.set({ mode: 'local' } as never)
+      const requestGateway = vi.fn(async () => ({}) as never)
+      let handle: HarnessHandle | null = null
+      await actRender(
+        <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+      )
+
+      await expect(
+        handle!.submitText('inspect this folder', {
+          attachments: [
+            {
+              id: `folder:${path}`,
+              kind: 'folder',
+              label: 'project',
+              path,
+              refText: '@folder:project'
+            }
+          ]
+        })
+      ).resolves.toBe(false)
+      expect(requestGateway).not.toHaveBeenCalled()
+    }
+  )
 
   it.each([undefined, 'reports/quarterly'])(
     'passes a remote workspace-relative folder ref through with path %s',
@@ -5268,6 +5303,9 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
 
     const chip = $composerAttachments.get()[0]!
     expect(chip.refText).toBe('@file:.hermes/desktop-attachments/DEVIS_signed.pdf')
+    expect(chip.path).toBe('.hermes/desktop-attachments/DEVIS_signed.pdf')
+    expect(chip.detail).toBe('.hermes/desktop-attachments/DEVIS_signed.pdf')
+    expect(chip.path).not.toContain('/Users/mahmoud')
     expect(chip.uploadState).toBeUndefined()
     expect(readFileDataUrl).toHaveBeenCalledWith('/Users/mahmoud/Downloads/DEVIS_signed.pdf')
   })
@@ -5387,7 +5425,7 @@ describe('uploadComposerAttachment preview reuse', () => {
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'image.attach_bytes') {
-        return { attached: true, path: '/gw/images/shot.png' } as never
+        return { attached: true, path: '/gw/images/shot.png', ref_path: 'images/shot.png' } as never
       }
 
       return {} as never
@@ -5410,7 +5448,39 @@ describe('uploadComposerAttachment preview reuse', () => {
       filename: 'shot.png',
       session_id: RUNTIME_SESSION_ID
     })
-    expect(uploaded.path).toBe('/gw/images/shot.png')
+    expect(uploaded.path).toBe('images/shot.png')
+  })
+  it('reuses the private desktop source when restaging an image after session recovery', async () => {
+    const hostPath = 'C:\\Users\\alice\\Pictures\\shot.png'
+    const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+    const requestGateway = vi.fn(async () => ({
+      attached: true,
+      path: '/gw/images/shot-2.png',
+      ref_path: 'images/shot-2.png'
+    })) as never
+
+    const uploaded = await uploadComposerAttachment(
+      {
+        attachedSessionId: 'stale-runtime',
+        id: 'image:shot.png',
+        kind: 'image',
+        label: 'shot.png',
+        path: 'images/shot.png',
+        sourcePath: hostPath
+      },
+      { requestGateway, sessionId: RUNTIME_SESSION_ID }
+    )
+
+    expect(readFileDataUrl).toHaveBeenCalledWith(hostPath)
+    expect(uploaded).toMatchObject({
+      attachedSessionId: RUNTIME_SESSION_ID,
+      path: 'images/shot-2.png',
+      sourcePath: hostPath
+    })
   })
 
   it('falls back to the disk read when previewUrl is not a base64 data URL', async () => {
@@ -5424,7 +5494,7 @@ describe('uploadComposerAttachment preview reuse', () => {
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'image.attach_bytes') {
-        return { attached: true, path: '/gw/images/shot.png' } as never
+        return { attached: true, path: '/gw/images/shot.png', ref_path: 'images/shot.png' } as never
       }
 
       return {} as never

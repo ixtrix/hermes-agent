@@ -5,6 +5,7 @@ import inspect
 import json
 import mimetypes
 import os
+import posixpath
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -91,6 +92,7 @@ TRAILING_PUNCTUATION = ",.;!?"
 _NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
 _SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
 _SENSITIVE_HERMES_DIRS = (Path("skills") / ".hub",)
+_SESSION_ATTACHMENT_REF_ROOT = ".hermes/desktop-attachments"
 _SENSITIVE_HOME_FILES = (
     Path(".ssh") / "authorized_keys",
     Path(".ssh") / "id_rsa",
@@ -390,9 +392,20 @@ def _expand_file_reference(
                 size = os.fstat(source.fileno()).st_size
                 sample = source.read(4096)
                 if _is_binary_sample(path, sample):
-                    return None, _binary_reference_block(ref, path, size=size)
+                    if size > 512 * 1024:
+                        raise ValueError(
+                            "session-owned binary attachment is too large for immutable context"
+                        )
+                    payload = sample + source.read()
+                    return None, _immutable_binary_reference_block(
+                        ref, path, payload
+                    )
                 text = (sample + source.read()).decode("utf-8")
             return None, _text_reference_block(ref, path, text)
+    if _is_session_attachment_ref(ref.target):
+        raise ValueError(
+            "session-owned attachment reference is not registered for this session"
+        )
 
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
@@ -602,6 +615,18 @@ def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None
     return _strip_reference_wrappers(value), None, None
 
 
+def _is_session_attachment_ref(target: str) -> bool:
+    lexical = str(target).replace("\\", "/")
+    normalized = posixpath.normpath(lexical)
+    prefix = f"{_SESSION_ATTACHMENT_REF_ROOT}/"
+    return (
+        lexical == _SESSION_ATTACHMENT_REF_ROOT
+        or lexical.startswith(prefix)
+        or normalized == _SESSION_ATTACHMENT_REF_ROOT
+        or normalized.startswith(prefix)
+    )
+
+
 def _is_binary_file(path: Path) -> bool:
     return _is_binary_sample(path, path.read_bytes()[:4096])
 
@@ -704,6 +729,25 @@ def _agent_visible_path(path: Path) -> str:
         return to_agent_visible_cache_path(str(path))
     except Exception:
         return str(path)
+
+
+def _immutable_binary_reference_block(
+    ref: ContextReference, path: Path, payload: bytes
+) -> str:
+    import base64
+    import hashlib
+
+    mime, _ = mimetypes.guess_type(path.name)
+    mime = mime or "application/octet-stream"
+    encoded = base64.b64encode(payload).decode("ascii")
+    return (
+        f"📎 {ref.raw} ({mime}, {format_bytes(len(payload))}, "
+        f"sha256 {hashlib.sha256(payload).hexdigest()}) — exact session-owned "
+        "bytes captured immutably. Decode the base64 payload below into a "
+        "temporary file before reading, converting, extracting, or rendering it; "
+        "do not reopen the workspace pathname and do not tell the user the file "
+        f"type is unsupported.\n```base64\n{encoded}\n```"
+    )
 
 
 def _binary_reference_block(

@@ -189,9 +189,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       }
 
       for (const attachment of attachments) {
-        if (!attachment.path || (attachment.kind === 'folder' && $connection.get()?.mode === 'remote')) {
-          assertAttachmentCanSubmitWithoutPath(attachment)
-        }
+        assertAttachmentCanSubmitWithoutPath(attachment)
 
         if (!attachment.path) {
           synced.push(attachment)
@@ -218,8 +216,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
               // and remove + same-path reattach must not receive stale staging.
               scope.attachments.updateIfCurrent(attachment, {
                 attachedSessionId: next.attachedSessionId,
+                detail: next.detail,
                 label: next.label,
                 path: next.path,
+                sourcePath: next.sourcePath,
                 refText: next.refText,
                 uploadState: next.uploadState
               })

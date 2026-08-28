@@ -80,11 +80,11 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
       try {
         let source = lightboxSrc || ''
 
-        // Upload may replace `path` with a gateway-side staged path while
-        // `detail` still carries the original host path. If submit then fails,
-        // keep the surviving chip previewable across split-filesystem setups.
+        // Upload replaces `path` and `detail` with the gateway-side staged
+        // path so prompt serialization cannot expose the desktop path.
+        // `sourcePath` is the private desktop-only fallback for lazy preview.
         if (!source) {
-          const paths = [attachment.path, attachment.detail].filter(
+          const paths = [attachment.path, attachment.sourcePath, attachment.detail].filter(
             (path, index, candidates): path is string => Boolean(path) && candidates.indexOf(path) === index
           )
 

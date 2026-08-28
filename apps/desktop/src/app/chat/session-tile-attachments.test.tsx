@@ -39,6 +39,7 @@ const RUNTIME_ID = 'runtime-tile'
 const STORED_ID = 'stored-tile'
 const HOST_PATH = 'C:\\Users\\alice\\Pictures\\photo.png'
 const STAGED_PATH = '/root/.hermes/attachments/photo.png'
+const STAGED_REF = 'images/photo.png'
 const THUMBNAIL = 'data:image/png;base64,dGh1bWJuYWls'
 const FULL_SOURCE = 'data:image/png;base64,b3JpZ2luYWw='
 
@@ -133,7 +134,7 @@ describe('session tile attachment occurrence ownership', () => {
   it('preserves a thumbnail that resolves before tile submit staging', async () => {
     const scope = createScope()
     const original = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -161,7 +162,7 @@ describe('session tile attachment occurrence ownership', () => {
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', expect.anything()))
     expect(scope.attachments.updateIfCurrent(original, { thumbnailUrl: THUMBNAIL })).toBe(true)
 
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(false)
@@ -170,7 +171,7 @@ describe('session tile attachment occurrence ownership', () => {
     expect(scope.attachments.$attachments.get()[0]).toMatchObject({
       attachedSessionId: RUNTIME_ID,
       occurrenceId: original.occurrenceId,
-      path: STAGED_PATH,
+      path: STAGED_REF,
       thumbnailUrl: THUMBNAIL
     })
   })
@@ -179,7 +180,7 @@ describe('session tile attachment occurrence ownership', () => {
     const scope = createScope()
     const original = makeAttachment()
     const replacement = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -208,7 +209,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.remove(original.id)
     scope.attachments.add(replacement)
 
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(false)
@@ -221,7 +222,7 @@ describe('session tile attachment occurrence ownership', () => {
     const scope = createScope()
     const original = makeAttachment()
     const replacement = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -245,7 +246,7 @@ describe('session tile attachment occurrence ownership', () => {
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', expect.anything()))
     scope.attachments.remove(original.id)
     scope.attachments.add(replacement)
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(true)

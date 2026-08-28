@@ -158,11 +158,7 @@ function needsQuoting(value: string): boolean {
   return /[\s()[\]{}<>"'`]/.test(value)
 }
 
-export function formatRefValue(value: string): string {
-  if (!needsQuoting(value)) {
-    return value
-  }
-
+function quoteRefValue(value: string): string {
   if (!value.includes('`')) {
     return `\`${value}\``
   }
@@ -176,6 +172,10 @@ export function formatRefValue(value: string): string {
   }
 
   return value
+}
+
+export function formatRefValue(value: string): string {
+  return needsQuoting(value) ? quoteRefValue(value) : value
 }
 
 export const hermesDirectiveFormatter: Unstable_DirectiveFormatter = {
@@ -210,7 +210,9 @@ export const hermesDirectiveFormatter: Unstable_DirectiveFormatter = {
       const kindMatch = rawText.match(/^@([^:]+):/)
       const kind = kindMatch?.[1] ?? item.type
 
-      return `@${kind}:${formatRefValue(insertId)}`
+      const formattedValue =
+        kind === 'file' && /:\d+(?:-\d+)?$/.test(insertId) ? quoteRefValue(insertId) : formatRefValue(insertId)
+      return `@${kind}:${formattedValue}`
     }
     // Parsed quoted file ranges keep their canonical wire value in `id` so
     // the range remains outside the closing quote across editor hydration.

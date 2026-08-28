@@ -12486,6 +12486,12 @@ class _ObservedAttachmentPath(NamedTuple):
     workspace: Path
     path: Path
     identities: tuple[tuple[int, int], ...]
+class _RegisteredAttachment(NamedTuple):
+    observed: _ObservedAttachmentPath
+    size: int
+    sha256: str
+
+
 
 
 class _StagedAttachment(NamedTuple):
@@ -12532,10 +12538,29 @@ def _assert_attachment_path_identities(observed: _ObservedAttachmentPath) -> Non
 
 
 def _trusted_session_attachment_opener(session: dict, target: str):
-    observed = session.get("_trusted_file_attachments", {}).get(target)
-    if observed is None:
+    import hashlib
+    import tempfile
+
+    registered = session.get("_trusted_file_attachments", {}).get(target)
+    if registered is None:
         return None
-    return _open_workspace_attachment_no_follow(observed)
+    source = _open_workspace_attachment_no_follow(registered.observed)
+    snapshot = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        while chunk := source.read(1024 * 1024):
+            snapshot.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        source.close()
+    if size != registered.size or digest.hexdigest() != registered.sha256:
+        snapshot.close()
+        raise ValueError("session-owned attachment bytes changed after staging")
+    snapshot.flush()
+    snapshot.seek(0)
+    return snapshot
 
 
 def _attachment_ref_path(target: Path) -> str:
@@ -12693,6 +12718,26 @@ def _open_workspace_attachment_windows(observed: _ObservedAttachmentPath):
     finally:
         if fd is not None:
             os.close(fd)
+def _write_attachment_stream(target, *, payload: bytes | None, source) -> tuple[int, str]:
+    import hashlib
+
+    digest = hashlib.sha256()
+    size = 0
+    if source is not None:
+        while chunk := source.read(1024 * 1024):
+            target.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    else:
+        content = payload or b""
+        target.write(content)
+        digest.update(content)
+        size = len(content)
+    return size, digest.hexdigest()
+
+
+
+
 
 
 def _write_unique_attachment_windows(
@@ -12700,15 +12745,19 @@ def _write_unique_attachment_windows(
     root: Path,
     filename: str,
     *,
+    reserved_names: set[str],
     payload: bytes | None = None,
     source=None,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, int, str]:
     """Exclusively create a Windows attachment and keep its verified handle open."""
     stem = Path(filename).stem or "attachment"
     suffix = Path(filename).suffix
     counter = 1
     while True:
         candidate_name = filename if counter == 1 else f"{stem}-{counter}{suffix}"
+        if candidate_name in reserved_names:
+            counter += 1
+            continue
         candidate = root / candidate_name
         try:
             fd = os.open(
@@ -12726,12 +12775,10 @@ def _write_unique_attachment_windows(
     try:
         _assert_windows_handle_path(fd, workspace, expected=candidate)
         with os.fdopen(fd, "wb", closefd=False) as target:
-            if source is not None:
-                while chunk := source.read(1024 * 1024):
-                    target.write(chunk)
-            else:
-                target.write(payload or b"")
-        return candidate, fd
+            size, sha256 = _write_attachment_stream(
+                target, payload=payload, source=source
+            )
+        return candidate, fd, size, sha256
     except Exception:
         os.close(fd)
         try:
@@ -12747,10 +12794,9 @@ def _open_desktop_attachment_dir(session: dict):
     import stat as _stat
 
     if os.name == "nt":
-        workspace, root = _prepare_windows_attachment_dir(session)
-        observed = _observe_workspace_attachment_path(workspace, root)
-        yield workspace, root, None, observed.identities
-        return
+        raise ValueError(
+            "secure workspace attachment staging is unavailable on Windows gateways"
+        )
 
     if (
         not hasattr(os, "O_NOFOLLOW")
@@ -12881,9 +12927,10 @@ def _write_unique_attachment(
     root_fd: int | None,
     filename: str,
     *,
+    reserved_names: set[str],
     payload: bytes | None = None,
     source=None,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, int, str]:
     """Create a uniquely named attachment and keep its descriptor open."""
     if os.name == "nt":
         return _write_unique_attachment_windows(
@@ -12892,6 +12939,7 @@ def _write_unique_attachment(
             filename,
             payload=payload,
             source=source,
+            reserved_names=reserved_names,
         )
 
     assert root_fd is not None
@@ -12901,6 +12949,9 @@ def _write_unique_attachment(
     counter = 1
     while True:
         candidate_name = filename if counter == 1 else f"{stem}-{counter}{suffix}"
+        if candidate_name in reserved_names:
+            counter += 1
+            continue
         try:
             fd = os.open(
                 candidate_name,
@@ -12918,12 +12969,10 @@ def _write_unique_attachment(
     candidate = root / candidate_name
     try:
         with os.fdopen(fd, "wb", closefd=False) as target:
-            if source is not None:
-                while chunk := source.read(1024 * 1024):
-                    target.write(chunk)
-            else:
-                target.write(payload or b"")
-        return candidate, fd
+            size, sha256 = _write_attachment_stream(
+                target, payload=payload, source=source
+            )
+        return candidate, fd, size, sha256
     except Exception:
         os.close(fd)
         try:
@@ -12956,8 +13005,7 @@ def _resolve_gateway_attachment_path(
         if not token:
             return None
         if len(token) >= 2 and token[0] in {'"', "'"} and token[-1] == token[0]:
-            token = token[1:-1].strip()
-        token = token.replace("\\ ", " ")
+            token = token[1:-1]
         if not token:
             return None
 
@@ -12991,7 +13039,7 @@ def _resolve_gateway_attachment_path(
 
         candidate = Path(expanded)
         if not candidate.is_absolute():
-            candidate = Path(os.getenv("TERMINAL_CWD", os.getcwd())) / candidate
+            candidate = workspace / candidate
         candidate = Path(os.path.abspath(candidate))
         if workspace_alias is not None:
             try:
@@ -13074,6 +13122,7 @@ def _stage_session_file_attachment(
 
     target_fd: int | None = None
     observed: _ObservedAttachmentPath | None = None
+    registered: _RegisteredAttachment | None = None
     ref_path = ""
     registry = session.setdefault("_trusted_file_attachments", {})
     try:
@@ -13084,11 +13133,12 @@ def _stage_session_file_attachment(
                 upload_dir_fd,
                 directory_identities,
             ):
-                target, target_fd = _write_unique_attachment(
+                target, target_fd, size, sha256 = _write_unique_attachment(
                     attachment_workspace,
                     upload_dir,
                     upload_dir_fd,
                     _sanitize_attachment_name(filename),
+                    reserved_names={Path(key).name for key in registry},
                     payload=payload,
                     source=source,
                 )
@@ -13098,20 +13148,21 @@ def _stage_session_file_attachment(
                     target,
                     (*directory_identities, _attachment_stat_identity(target_info)),
                 )
+                registered = _RegisteredAttachment(observed, size, sha256)
                 ref_path = _attachment_ref_path(target)
-                registry[ref_path] = observed
+                registry[ref_path] = registered
                 yield _StagedAttachment(
                     target, ref_path, uploaded, observed
                 )
 
-        # A wrapping staging context can replace `.hermes` while its descriptors
-        # close. Reopen the registered chain before the RPC response is allowed
-        # to escape; prompt.submit repeats the same identity check.
-        assert observed is not None
-        with _open_workspace_attachment_no_follow(observed):
+        # A wrapping staging context can replace `.hermes` or mutate the staged
+        # file while its descriptors close. Reopen and hash the registered bytes
+        # before the RPC response escapes; prompt.submit repeats the same checks.
+        assert registered is not None
+        with _trusted_session_attachment_opener(session, ref_path):
             pass
     except Exception:
-        if observed is not None and registry.get(ref_path) == observed:
+        if registered is not None and registry.get(ref_path) == registered:
             registry.pop(ref_path, None)
         raise
     finally:

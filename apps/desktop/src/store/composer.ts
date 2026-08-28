@@ -19,6 +19,9 @@ export interface ComposerAttachment {
   /** Downscaled data URL for the attachment card and optimistic bubble only. */
   thumbnailUrl?: string
   path?: string
+  /** Desktop-only original image path used for lazy preview after `path` is
+   * rewritten to a session-owned gateway path. Never serialized into prompts. */
+  sourcePath?: string
   attachedSessionId?: string
   /** Set while the file/image bytes are being staged into the session
    * workspace (remote upload or local stage), and 'error' if that failed.

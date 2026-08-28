@@ -12,6 +12,8 @@ export interface ContextSuggestion {
 export interface ImageAttachResponse {
   attached?: boolean
   path?: string
+  /** Opaque session-owned image ref returned by image.attach_bytes. */
+  ref_path?: string
   text?: string
   message?: string
   // Returned by the byte-upload variant (image.attach_bytes) used in remote mode.
@@ -31,9 +33,9 @@ export interface ImageDetachResponse {
 export interface FileAttachResponse {
   attached?: boolean
   message?: string
-  // Gateway-side absolute path the file was staged to.
+  // Legacy response field; attachment state must not retain an absolute value.
   path?: string
-  // Workspace-relative path used to build ref_text.
+  // Canonical workspace-relative path used to build ref_text.
   ref_path?: string
   // Rewritten @file: ref that resolves on the gateway (workspace-relative).
   ref_text?: string

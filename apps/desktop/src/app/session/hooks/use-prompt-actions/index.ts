@@ -87,10 +87,11 @@ interface HandoffResult {
   error?: string
 }
 
-const ABSOLUTE_DESKTOP_PATH_RE = /^(?:[A-Za-z]:[\\/]|[\\/])/
+const ABSOLUTE_DESKTOP_PATH_RE = /^(?:file:\/\/|[A-Za-z]:[\\/]|[\\/])/i
 
-// Absolute/rooted paths name files on the desktop host, not a gateway-owned
-// workspace. Always send their bytes; only workspace-relative refs pass through.
+// Absolute/rooted paths and file: URIs name files on the desktop host, not a
+// gateway-owned workspace. Always send their bytes; only workspace-relative
+// refs pass through.
 function isAbsoluteDesktopPath(path: string): boolean {
   return ABSOLUTE_DESKTOP_PATH_RE.test(path.trim())
 }
@@ -139,7 +140,7 @@ export async function uploadComposerAttachment(
   }
 ): Promise<ComposerAttachment> {
   const { requestGateway, storedSessionId, onSessionRecovered } = opts
-  const path = attachment.path ?? ''
+  const path = attachment.kind === 'image' ? attachment.sourcePath || attachment.path || '' : attachment.path || ''
   const label = attachment.label || pathLabel(path)
   const uploadBytes = isAbsoluteDesktopPath(path)
 
@@ -183,14 +184,12 @@ export async function uploadComposerAttachment(
       if (!result.attached) {
         throw new Error(result.message || `Could not attach ${label}`)
       }
-
-      // A byte upload crossed the desktop/gateway trust boundary. The response
-      // must name the session-owned copy; falling back to the desktop path
-      // would reintroduce that path into chips, edit drafts, and prompts.
-      const attachedPath = result.path || (uploadBytes ? '' : path)
-
-      if (!attachedPath) {
-        throw new Error(`Could not attach ${label}: gateway returned no session-owned image path`)
+      // A byte upload crossed the desktop/gateway trust boundary. Its absolute
+      // storage path stays private to the gateway; chips and prompts retain
+      // only the session-owned opaque ref returned for those queued bytes.
+      const attachedPath = uploadBytes ? result.ref_path || '' : path
+      if (!attachedPath || (uploadBytes && isAbsoluteDesktopPath(attachedPath))) {
+        throw new Error(`Could not attach ${label}: gateway returned no session-owned image ref`)
       }
 
       return {
@@ -199,6 +198,7 @@ export async function uploadComposerAttachment(
         detail: attachedPath,
         label: pathLabel(attachedPath),
         path: attachedPath,
+        sourcePath: uploadBytes ? attachment.sourcePath || path : attachment.sourcePath,
         refText: `@image:${formatRefValue(attachedPath)}`,
         uploadState: undefined
       }
@@ -210,13 +210,25 @@ export async function uploadComposerAttachment(
       ...(fileDataUrl ? { data_url: fileDataUrl } : { path })
     })
 
-    if (!result.attached || !result.ref_text) {
-      throw new Error(result.message || `Could not attach ${label}`)
+    const attachedRef = parseReference(result.ref_text || '')
+    const attachedPath = result.ref_path || attachedRef?.value || ''
+
+    if (
+      !result.attached ||
+      !result.ref_text ||
+      attachedRef?.kind !== 'file' ||
+      !attachedPath ||
+      isAbsoluteDesktopPath(attachedPath)
+    ) {
+      throw new Error(result.message || `Could not attach ${label}: gateway returned no session-owned file path`)
     }
 
     return {
       ...attachment,
       attachedSessionId: liveSessionId,
+      detail: attachedPath,
+      label: pathLabel(attachedPath),
+      path: attachedPath,
       refText: result.ref_text,
       uploadState: undefined
     }
@@ -378,12 +390,10 @@ export function usePromptActions({
           await inFlight
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
-        // Pathless context refs are valid only when their path namespace is
-        // visible to the gateway. Remote sessions also cannot resolve a
-        // desktop-local folder path because folders have no byte-upload seam.
-        if (!attachment.path || (attachment.kind === 'folder' && $connection.get()?.mode === 'remote')) {
-          assertAttachmentCanSubmitWithoutPath(attachment)
-        }
+        // Pathless context refs are valid only when their namespace is visible
+        // to the gateway. Folders have no byte-upload seam, so validate every
+        // folder in every connection mode before it can reach prompt.submit.
+        assertAttachmentCanSubmitWithoutPath(attachment)
 
         if (!attachment.path) {
           synced.push(attachment)
@@ -414,8 +424,10 @@ export function usePromptActions({
               // while still refusing a remove + re-add of the same path.
               patchMainComposerAttachmentOccurrence(original, {
                 attachedSessionId: nextAttachment.attachedSessionId,
+                detail: nextAttachment.detail,
                 label: nextAttachment.label,
                 path: nextAttachment.path,
+                sourcePath: nextAttachment.sourcePath,
                 refText: nextAttachment.refText,
                 uploadState: nextAttachment.uploadState
               })
