@@ -13132,6 +13132,12 @@ def _stage_session_file_attachment(
         )
         if resolved is None:
             raise ValueError("file not found on gateway and no data_url provided")
+        from agent.file_safety import get_read_block_error
+
+        if get_read_block_error(str(resolved.path)) is not None:
+            raise ValueError(
+                "path is a sensitive credential or internal Hermes path and cannot be attached"
+            )
         filename = _sanitize_attachment_name(name or resolved.path.name)
         source_context = _open_workspace_attachment_no_follow(resolved)
 

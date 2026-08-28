@@ -11260,6 +11260,29 @@ def test_file_attach_rejects_gateway_visible_file_outside_workspace(monkeypatch,
         server._sessions.pop("sid", None)
 
 
+def test_file_attach_rejects_sensitive_gateway_visible_file(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / ".env"
+    source.write_text("SECRET=not-for-context", encoding="utf-8")
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "sensitive credential" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
 @pytest.mark.require_symlinks
 def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
