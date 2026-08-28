@@ -2842,8 +2842,6 @@ describe('usePromptActions file attachment sync', () => {
         path: 'C:\\Users\\alice\\Pictures\\photo.jpg'
       },
       {
-        backendCwd: '/root',
-        remote: false,
         requestGateway,
         sessionId: RUNTIME_SESSION_ID
       }
@@ -2857,6 +2855,45 @@ describe('usePromptActions file attachment sync', () => {
     })
     expect(requestGateway).not.toHaveBeenCalledWith('image.attach', expect.anything())
     expect(uploaded.path).toBe('/root/tmp/photo.jpg')
+  })
+  it('uploads Windows root-relative file and image bytes instead of leaking their paths', async () => {
+    const readFileDataUrl = vi.fn(async (path: string) =>
+      path.endsWith('.png') ? 'data:image/png;base64,aW1hZ2U=' : 'data:text/plain;base64,ZmlsZQ=='
+    )
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'file.attach') {
+        return { attached: true, ref_text: '@file:.hermes/desktop-attachments/report.txt' } as never
+      }
+
+      return { attached: true, path: '/root/.hermes/desktop-attachments/photo.png' } as never
+    })
+
+    await uploadComposerAttachment(
+      { id: 'file:report', kind: 'file', label: 'report.txt', path: '\\Users\\alice\\report.txt' },
+      { requestGateway, sessionId: RUNTIME_SESSION_ID }
+    )
+    await uploadComposerAttachment(
+      { id: 'image:photo', kind: 'image', label: 'photo.png', path: '\\Users\\alice\\photo.png' },
+      { requestGateway, sessionId: RUNTIME_SESSION_ID }
+    )
+
+    expect(readFileDataUrl).toHaveBeenNthCalledWith(1, '\\Users\\alice\\report.txt')
+    expect(readFileDataUrl).toHaveBeenNthCalledWith(2, '\\Users\\alice\\photo.png')
+    expect(requestGateway).toHaveBeenNthCalledWith(1, 'file.attach', {
+      data_url: 'data:text/plain;base64,ZmlsZQ==',
+      name: 'report.txt',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'image.attach_bytes', {
+      content_base64: 'aW1hZ2U=',
+      filename: 'photo.png',
+      session_id: RUNTIME_SESSION_ID
+    })
   })
 
   it('merges image staging into the current occurrence without dropping its thumbnail', async () => {
@@ -3110,7 +3147,8 @@ describe('usePromptActions file attachment sync', () => {
     '@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`:1-3',
     '  @file:   "/Users/mahmoud/Downloads/DEVIS_signed.pdf" :1-3  ',
     '@file://server/share',
-    '@file:"C:\\Users\\alice\\Downloads\\DEVIS_signed.pdf":12'
+    '@file:"C:\\Users\\alice\\Downloads\\DEVIS_signed.pdf":12',
+    '@file:"\\Users\\alice\\Downloads\\DEVIS_signed.pdf"'
   ])('rejects a remote pathless absolute workstation ref: %s', async refText => {
     $connection.set({ mode: 'remote' } as never)
     const readFileDataUrl = vi.fn(async () => 'data:application/pdf;base64,JVBERi0=')
@@ -5242,7 +5280,7 @@ describe('uploadComposerAttachment remote read failures', () => {
     await expect(
       uploadComposerAttachment(
         { id: 'file:big', kind: 'file', label: 'huge.csv', path: '/abs/huge.csv' },
-        { remote: true, requestGateway, sessionId: RUNTIME_SESSION_ID }
+        { requestGateway, sessionId: RUNTIME_SESSION_ID }
       )
     ).rejects.toThrow('huge.csv is too large to upload to the remote gateway (max 16 MB).')
 
@@ -5263,7 +5301,7 @@ describe('uploadComposerAttachment remote read failures', () => {
     await expect(
       uploadComposerAttachment(
         { id: 'file:gone', kind: 'file', label: 'gone.csv', path: '/abs/gone.csv' },
-        { remote: true, requestGateway: vi.fn(async () => ({}) as never), sessionId: RUNTIME_SESSION_ID }
+        { requestGateway: vi.fn(async () => ({}) as never), sessionId: RUNTIME_SESSION_ID }
       )
     ).rejects.toThrow('ENOENT: no such file')
   })
@@ -5299,7 +5337,7 @@ describe('uploadComposerAttachment preview reuse', () => {
         path: '/local/shot.png',
         previewUrl: 'data:image/png;base64,ZnJvbS1wcmV2aWV3'
       },
-      { remote: true, requestGateway, sessionId: RUNTIME_SESSION_ID }
+      { requestGateway, sessionId: RUNTIME_SESSION_ID }
     )
 
     expect(readFileDataUrl).not.toHaveBeenCalled()
@@ -5336,7 +5374,7 @@ describe('uploadComposerAttachment preview reuse', () => {
         path: '/local/shot.png',
         previewUrl: 'https://gateway.example/media/shot.png'
       },
-      { remote: true, requestGateway, sessionId: RUNTIME_SESSION_ID }
+      { requestGateway, sessionId: RUNTIME_SESSION_ID }
     )
 
     expect(readFileDataUrl).toHaveBeenCalledWith('/local/shot.png')

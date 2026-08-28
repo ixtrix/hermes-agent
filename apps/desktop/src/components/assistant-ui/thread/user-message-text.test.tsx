@@ -36,6 +36,18 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(screen.queryByTitle('http://localhost:3000')).not.toBeNull()
   })
 
+  it('preserves a file line range in both parsing and the rendered chip target', () => {
+    expect(parseReference('@file:src/a.ts:12')).toEqual({
+      kind: 'file',
+      lineRange: '12',
+      value: 'src/a.ts'
+    })
+
+    render(<UserMessageText text="open @file:src/a.ts:12 now" />)
+
+    expect(screen.queryByTitle('src/a.ts:12')).not.toBeNull()
+  })
+
   it('chips a backtick-quoted @file: path with spaces', () => {
     render(<UserMessageText text="see @file:`apps/desktop/my notes.md` please" />)
 

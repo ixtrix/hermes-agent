@@ -12726,6 +12726,7 @@ def _sanitize_attachment_name(name: str) -> str:
 
     candidate = Path(str(name or "").strip()).name
     candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
+    candidate = _re.sub(r":(?=\d+(?:-\d+)?$)", "_", candidate)
     candidate = candidate.strip().strip(".")
     return candidate or "attachment"
 

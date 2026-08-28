@@ -39,6 +39,17 @@ describe('hermesDirectiveFormatter.parse', () => {
     ])
   })
 
+  it('keeps a file line range in the chip target and serialized reference', () => {
+    const [segment] = hermesDirectiveFormatter.parse('@file:src/a.ts:12')
+
+    expect(segment).toEqual({ kind: 'mention', type: 'file', label: 'src/a.ts:12', id: 'src/a.ts:12' })
+    expect(
+      segment.kind === 'mention'
+        ? hermesDirectiveFormatter.serialize({ id: segment.id, label: segment.label, type: segment.type })
+        : ''
+    ).toBe('@file:src/a.ts:12')
+  })
+
   it('parses session links with profile/id values', () => {
     const segments = hermesDirectiveFormatter.parse('see @session:work/20260101_abc123 next')
 

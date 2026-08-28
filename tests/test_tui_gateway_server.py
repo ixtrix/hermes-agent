@@ -10420,7 +10420,49 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         server._sessions.pop("sid", None)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file handles")
+def test_file_attach_with_real_session_create_and_cli_resolution(monkeypatch, tmp_path):
+    """Exercise production session creation and path resolution."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("real session bytes", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "_schedule_session_cap_enforcement", lambda *_args, **_kwargs: None
+    )
+
+    created = server.handle_request(
+        {
+            "id": "create",
+            "method": "session.create",
+            "params": {"cwd": str(workspace)},
+        }
+    )
+    sid = created["result"]["session_id"]
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "attach",
+                "method": "file.attach",
+                "params": {"session_id": sid, "path": str(source)},
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        assert created["result"]["info"]["cwd"] == str(workspace)
+        assert (
+            resp["result"]["ref_text"]
+            == "@file:.hermes/desktop-attachments/report.txt"
+        )
+        assert resp["result"]["uploaded"] is False
+        assert stored.read_text(encoding="utf-8") == "real session bytes"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.windows_only
 def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
     """Windows uses verified handles for both the workspace source and staged copy."""
     workspace = tmp_path / "workspace"
@@ -10453,7 +10495,7 @@ def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
 
 
 
-@pytest.mark.skipif(os.name == "nt", reason="requires POSIX O_NOFOLLOW semantics")
+@pytest.mark.linux_only
 def test_file_attach_rejects_symlinked_workspace_staging_directory(
     monkeypatch, tmp_path
 ):
@@ -10527,6 +10569,42 @@ def test_file_attach_uploaded_pdf_becomes_model_context(monkeypatch, tmp_path):
         assert "--- Attached Context ---" in context.message
         assert "application/pdf" in context.message
         assert "binary file, not inlined" in context.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_range_shaped_name_remains_preprocessable(monkeypatch, tmp_path):
+    """A filename ending in :digits must not be mistaken for a source line range."""
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report:3000",
+                    "data_url": "data:text/plain;base64,cmFuZ2Ugc2FmZSBjb250ZW50",
+                },
+            }
+        )
+        ref_text = resp["result"]["ref_text"]
+        context = preprocess_context_references(
+            f"Review {ref_text}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+        )
+
+        assert ref_text == "@file:.hermes/desktop-attachments/report_3000"
+        assert context.warnings == []
+        assert context.expanded is True
+        assert "range safe content" in context.message
     finally:
         server._sessions.pop("sid", None)
 
@@ -10628,7 +10706,7 @@ def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="requires POSIX O_NOFOLLOW semantics")
+@pytest.mark.linux_only
 def test_file_attach_rejects_symlink_swap_after_workspace_resolution(
     monkeypatch, tmp_path
 ):

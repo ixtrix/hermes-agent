@@ -22,7 +22,7 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $connection, $sessions, $terminalBackend, sessionMatchesStoredId } from '@/store/session'
+import { $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $sessionStates, patchSessionTile, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
@@ -178,7 +178,6 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
-      const remote = $connection.get()?.mode === 'remote'
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
@@ -191,11 +190,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       for (const attachment of attachments) {
         if (!attachment.path) {
-          assertAttachmentCanSubmitWithoutPath(attachment, {
-            backendCwd: readState()?.cwd,
-            remote,
-            terminalBackend: $terminalBackend.get()
-          })
+          assertAttachmentCanSubmitWithoutPath(attachment)
           synced.push(attachment)
           continue
         }
@@ -207,13 +202,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
           const next = await uploadComposerAttachment(attachment, {
-            backendCwd: readState()?.cwd,
-            remote,
             requestGateway,
             sessionId: liveSessionId,
             storedSessionId: storedIdRef.current,
-            onSessionRecovered,
-            terminalBackend: $terminalBackend.get()
+            onSessionRecovered
           })
 
           if (options.updateComposerAttachments ?? true) {

@@ -12,6 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, userMessage } from '../test-utils'
 
@@ -20,6 +21,7 @@ stubThreadEnvironment()
 
 afterEach(() => {
   cleanup()
+  clearNotifications()
 })
 
 stubThreadViewportSize()
@@ -177,6 +179,49 @@ describe('click-to-edit user message', () => {
 
     expect(editor.className).toContain('max-h-48')
     expect(editor.className).toContain('overflow-y-auto')
+  })
+
+  it('does not insert an OS path when no gateway session is available to stage the drop', async () => {
+    const previousDesktop = window.hermesDesktop
+    const file = new File(['secret'], 'secret.pdf', { type: 'application/pdf' })
+    const dataTransfer = {
+      dropEffect: 'none',
+      files: { item: () => file, length: 1 },
+      getData: () => '',
+      items: [
+        {
+          getAsFile: () => file,
+          kind: 'file',
+          webkitGetAsEntry: () => ({ isDirectory: false })
+        }
+      ],
+      types: ['Files']
+    } as unknown as DataTransfer
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { ...previousDesktop, getPathForFile: () => '/Users/alice/secret.pdf' }
+    })
+
+    try {
+      render(<IncrementalHarness onEdit={async () => {}} />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }))
+      const editor = await screen.findByRole('textbox', { name: 'Edit message' })
+
+      fireEvent.drop(editor, { dataTransfer })
+
+      await waitFor(() =>
+        expect($notifications.get()).toEqual([
+          expect.objectContaining({
+            kind: 'error',
+            message: expect.stringContaining('No active gateway session is available to stage dropped files')
+          })
+        ])
+      )
+      expect(editor.textContent).not.toContain('/Users/alice/secret.pdf')
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: previousDesktop })
+    }
   })
 })
 

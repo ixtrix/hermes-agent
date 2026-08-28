@@ -28,10 +28,7 @@ import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
-  $connection,
-  $currentCwd,
   $messages,
-  $terminalBackend,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
@@ -88,38 +85,22 @@ interface HandoffResult {
   error?: string
 }
 
-const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
-const POSIX_ABSOLUTE_PATH_RE = /^\//
+const ABSOLUTE_DESKTOP_PATH_RE = /^(?:[A-Za-z]:[\\/]|[\\/])/
 
-export interface AttachmentBackendContext {
-  backendCwd?: null | string
-  remote: boolean
-  terminalBackend?: string
+// Absolute/rooted paths name files on the desktop host, not a gateway-owned
+// workspace. Always send their bytes; only workspace-relative refs pass through.
+function isAbsoluteDesktopPath(path: string): boolean {
+  return ABSOLUTE_DESKTOP_PATH_RE.test(path.trim())
 }
 
-// Absolute paths name files on the desktop host, not a gateway-owned workspace.
-// Always send their bytes; only workspace-relative refs are safe to pass through.
-function attachmentPathNeedsUpload(path: string, _context: AttachmentBackendContext): boolean {
-  const normalized = path.trim()
-  return WINDOWS_ABSOLUTE_PATH_RE.test(normalized) || POSIX_ABSOLUTE_PATH_RE.test(normalized)
-}
-
-export function assertAttachmentCanSubmitWithoutPath(
-  attachment: ComposerAttachment,
-  opts: AttachmentBackendContext
-): void {
+export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachment): void {
   if (attachment.path || (attachment.kind !== 'image' && attachment.kind !== 'file')) {
     return
   }
 
-  const parsedRef = parseReference(attachment.refText || '')
-  const refPath = parsedRef?.value || ''
+  const refPath = parseReference(attachment.refText || '')?.value || ''
 
-  if (
-    refPath &&
-    (WINDOWS_ABSOLUTE_PATH_RE.test(refPath) || POSIX_ABSOLUTE_PATH_RE.test(refPath)) &&
-    attachmentPathNeedsUpload(refPath, opts)
-  ) {
+  if (refPath && isAbsoluteDesktopPath(refPath)) {
     throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
   }
 }
@@ -133,7 +114,7 @@ export function assertAttachmentCanSubmitWithoutPath(
  */
 export async function uploadComposerAttachment(
   attachment: ComposerAttachment,
-  opts: AttachmentBackendContext & {
+  opts: {
     requestGateway: GatewayRequest
     sessionId: string
     /** Durable id used to re-register after sleep/wake or a backend restart. */
@@ -145,7 +126,7 @@ export async function uploadComposerAttachment(
   const { requestGateway, storedSessionId, onSessionRecovered } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
-  const uploadBytes = attachmentPathNeedsUpload(path, opts)
+  const uploadBytes = isAbsoluteDesktopPath(path)
 
   // Read bytes/paths ONCE, outside the retry. Only the session-scoped RPC is
   // replayed on recovery — re-reading a multi-MB file to retry a dead session
@@ -349,7 +330,6 @@ export function usePromptActions({
       options: { updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
-      const remote = $connection.get()?.mode === 'remote'
       const storedSessionId = selectedStoredSessionIdRef.current
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
@@ -379,11 +359,7 @@ export function usePromptActions({
         // visible to the gateway. Parse quoting and optional line ranges before
         // deciding so alternate spellings cannot smuggle a workstation path.
         if (!attachment.path) {
-          assertAttachmentCanSubmitWithoutPath(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
-            terminalBackend: $terminalBackend.get()
-          })
+          assertAttachmentCanSubmitWithoutPath(attachment)
           synced.push(attachment)
           continue
         }
@@ -399,13 +375,10 @@ export function usePromptActions({
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
           const nextAttachment = await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
             requestGateway,
             sessionId: liveSessionId,
             storedSessionId,
-            onSessionRecovered,
-            terminalBackend: $terminalBackend.get()
+            onSessionRecovered
           })
 
           // Update-only: never resurrect a chip the user removed mid-upload.
@@ -450,8 +423,6 @@ export function usePromptActions({
   // image.attach_bytes.
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
-      const remote = $connection.get()?.mode === 'remote'
-
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
       try {
@@ -459,11 +430,8 @@ export function usePromptActions({
         // don't resurrect it — just drop the staged result on the floor.
         updateComposerAttachment(
           await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
             requestGateway,
-            sessionId,
-            terminalBackend: $terminalBackend.get()
+            sessionId
           })
         )
       } catch (err) {

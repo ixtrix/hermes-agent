@@ -237,7 +237,8 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
     ...Array.from(text.matchAll(HERMES_DIRECTIVE_RE)).map(match => {
       const parsed = parseReference(match[0])
       const type = parsed?.kind || match[1] || 'file'
-      const id = parsed?.value || unwrapRefValue(match[2] || '')
+      const baseId = parsed?.value || unwrapRefValue(match[2] || '')
+      const id = parsed?.lineRange ? `${baseId}:${parsed.lineRange}` : baseId
 
       return {
         start: match.index ?? 0,
