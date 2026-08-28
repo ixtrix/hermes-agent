@@ -10,7 +10,7 @@ import {
   createComposerAttachmentOccurrenceId,
   createComposerAttachmentScope
 } from '@/store/composer'
-import { $connection, $sessions } from '@/store/session'
+import { $connection, $sessions, $terminalBackend } from '@/store/session'
 import { $sessionStates, type SessionTileDelegate, setSessionTileDelegate } from '@/store/session-states'
 
 import { deferred } from '../../test/deferred'
@@ -108,6 +108,7 @@ describe('session tile attachment occurrence ownership', () => {
     requestGateway.mockReset()
     $connection.set({ mode: 'local' } as never)
     $sessions.set([])
+    $terminalBackend.set('')
     $sessionStates.set({
       [RUNTIME_ID]: {
         ...createClientSessionState(STORED_ID),
@@ -123,6 +124,7 @@ describe('session tile attachment occurrence ownership', () => {
 
   afterEach(() => {
     Reflect.deleteProperty(window, 'hermesDesktop')
+    $terminalBackend.set('')
     $connection.set(null)
     $sessions.set([])
     $sessionStates.set({})
@@ -318,5 +320,68 @@ describe('session tile attachment occurrence ownership', () => {
     })
 
     expect(scope.attachments.$attachments.get()).toEqual([])
+  })
+
+  it.each([
+    "@file:'/Users/alice/report.pdf'",
+    '@file:"/Users/alice/report.pdf"',
+    '@file:`/Users/alice/report.pdf`:1-3',
+    '  @file:   "/Users/alice/report.pdf" :1-3  ',
+    '@file://server/share'
+  ])('rejects a remote pathless absolute file ref: %s', async refText => {
+    $connection.set({ mode: 'remote' } as never)
+    const scope = createScope()
+    scope.attachments.add({
+      id: `file:${refText}`,
+      kind: 'file',
+      label: 'report.pdf',
+      refText
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('read this')).resolves.toBe(false)
+    })
+
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it.each(['docker', 'ssh'])('uploads POSIX host file bytes for a local %s tile backend', async terminalBackend => {
+    $terminalBackend.set(terminalBackend)
+    const scope = createScope()
+    scope.attachments.add({
+      id: 'file:/Users/alice/report.pdf',
+      kind: 'file',
+      label: 'report.pdf',
+      path: '/Users/alice/report.pdf',
+      refText: '@file:`/Users/alice/report.pdf`'
+    })
+    requestGateway.mockImplementation(async (method: string) => {
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          ref_text: '@file:.hermes/desktop-attachments/report.pdf',
+          uploaded: true
+        }
+      }
+
+      return {}
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('read this')).resolves.toBe(true)
+    })
+
+    expect(window.hermesDesktop?.readFileDataUrl).toHaveBeenCalledWith('/Users/alice/report.pdf')
+    expect(requestGateway).toHaveBeenCalledWith('file.attach', {
+      data_url: FULL_SOURCE,
+      name: 'report.pdf',
+      session_id: RUNTIME_ID
+    })
   })
 })

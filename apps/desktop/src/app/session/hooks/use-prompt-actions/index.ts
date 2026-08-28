@@ -3,6 +3,7 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { parseReference } from '@/components/assistant-ui/reference-kinds'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
@@ -88,36 +89,56 @@ interface HandoffResult {
 }
 
 const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
-const POSIX_ABSOLUTE_PATH_RE = /^\/(?!\/)/
+const POSIX_ABSOLUTE_PATH_RE = /^\//
+const CONTAINER_TERMINAL_BACKENDS: Record<string, true> = {
+  daytona: true,
+  docker: true,
+  modal: true,
+  singularity: true,
+  ssh: true,
+  vercel_sandbox: true
+}
 
-// Terminal backends whose execution environment has its own filesystem
-// (docker/ssh/singularity/modal/...) cannot see the desktop's host paths —
-// they must be crossed as bytes, like remote attachments. Mirrors the
-// container_backend set in tools/terminal_tool.py::_get_env_config.
-const CONTAINER_TERMINAL_BACKENDS = new Set(['docker', 'ssh', 'singularity', 'modal', 'daytona', 'vercel_sandbox'])
+export interface AttachmentBackendContext {
+  backendCwd?: null | string
+  remote: boolean
+  terminalBackend?: string
+}
 
 // `mode: local` means the gateway was launched locally, not necessarily that
-// Electron and the gateway share a filesystem. Windows Desktop can front a
-// WSL/Docker backend whose cwd is POSIX, so a Windows host path must cross the
-// boundary as bytes just like a remote attachment. Container terminal backends
-// (docker, ssh, ...) always need bytes: the sandbox has its own filesystem and
-// the host path would dangle inside it (#76577).
-function attachmentPathNeedsUpload(path: string, backendCwd?: null | string, terminalBackend?: string): boolean {
-  if (CONTAINER_TERMINAL_BACKENDS.has((terminalBackend || '').trim().toLowerCase())) {
+// Electron and the gateway share a filesystem. Container backends and mismatched
+// host/backend path families need bytes. Windows paths always upload because the
+// gateway's race-resistant fallback relies on POSIX dir-fd + O_NOFOLLOW.
+function attachmentPathNeedsUpload(path: string, context: AttachmentBackendContext): boolean {
+  if (
+    context.remote ||
+    CONTAINER_TERMINAL_BACKENDS[(context.terminalBackend || '').trim().toLowerCase()] ||
+    WINDOWS_ABSOLUTE_PATH_RE.test(path.trim())
+  ) {
     return true
   }
 
-  return WINDOWS_ABSOLUTE_PATH_RE.test(path.trim()) && POSIX_ABSOLUTE_PATH_RE.test(backendCwd?.trim() || '')
+  return POSIX_ABSOLUTE_PATH_RE.test(path.trim()) && WINDOWS_ABSOLUTE_PATH_RE.test(context.backendCwd?.trim() || '')
 }
 
-function attachmentRefHasAbsolutePath(refText?: string): boolean {
-  const raw = (refText || '')
-    .trim()
-    .replace(/^@(?:file|image):/, '')
-    .trim()
-  const path = raw.startsWith('`') && raw.endsWith('`') ? raw.slice(1, -1) : raw
+export function assertAttachmentCanSubmitWithoutPath(
+  attachment: ComposerAttachment,
+  opts: AttachmentBackendContext
+): void {
+  if (attachment.path || (attachment.kind !== 'image' && attachment.kind !== 'file')) {
+    return
+  }
 
-  return WINDOWS_ABSOLUTE_PATH_RE.test(path) || POSIX_ABSOLUTE_PATH_RE.test(path)
+  const parsedRef = parseReference(attachment.refText || '')
+  const refPath = parsedRef?.value || ''
+
+  if (
+    refPath &&
+    (WINDOWS_ABSOLUTE_PATH_RE.test(refPath) || POSIX_ABSOLUTE_PATH_RE.test(refPath)) &&
+    attachmentPathNeedsUpload(refPath, opts)
+  ) {
+    throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
+  }
 }
 
 /**
@@ -130,22 +151,19 @@ function attachmentRefHasAbsolutePath(refText?: string): boolean {
  */
 export async function uploadComposerAttachment(
   attachment: ComposerAttachment,
-  opts: {
-    backendCwd?: null | string
-    remote: boolean
+  opts: AttachmentBackendContext & {
     requestGateway: GatewayRequest
     sessionId: string
     /** Durable id used to re-register after sleep/wake or a backend restart. */
     storedSessionId?: null | string
     /** Called when the attach recovered onto a fresh live id. */
     onSessionRecovered?: (sessionId: string) => void
-    terminalBackend?: string
   }
 ): Promise<ComposerAttachment> {
-  const { backendCwd, remote, requestGateway, storedSessionId, onSessionRecovered, terminalBackend } = opts
+  const { requestGateway, storedSessionId, onSessionRecovered } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
-  const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
+  const uploadBytes = attachmentPathNeedsUpload(path, opts)
 
   // Read bytes/paths ONCE, outside the retry. Only the session-scoped RPC is
   // replayed on recovery — re-reading a multi-MB file to retry a dead session
@@ -375,19 +393,15 @@ export function usePromptActions({
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
 
-        // Pathless context refs are valid only when they are already
-        // workspace-relative. Never forward a workstation-absolute ref to a
-        // remote gateway: it cannot read that namespace, and accepting it
-        // would bypass the uploaded-byte boundary.
+        // Pathless context refs are valid only when their path namespace is
+        // visible to the gateway. Parse quoting and optional line ranges before
+        // deciding so alternate spellings cannot smuggle a workstation path.
         if (!attachment.path) {
-          if (
-            remote &&
-            (attachment.kind === 'image' || attachment.kind === 'file') &&
-            attachmentRefHasAbsolutePath(attachment.refText)
-          ) {
-            throw new Error(`Could not attach ${attachment.label || 'file'}: local file bytes are unavailable`)
-          }
-
+          assertAttachmentCanSubmitWithoutPath(attachment, {
+            backendCwd: $currentCwd.get(),
+            remote,
+            terminalBackend: $terminalBackend.get()
+          })
           synced.push(attachment)
           continue
         }

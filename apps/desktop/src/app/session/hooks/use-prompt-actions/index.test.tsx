@@ -3009,8 +3009,8 @@ describe('usePromptActions file attachment sync', () => {
 
   it('uploads file bytes when the terminal backend is a container (docker)', async () => {
     // Container backends have their own filesystem: the host drop path would
-    // dangle inside the sandbox, so the bytes must cross via file.attach's
-    // data_url pipeline and be staged into a bind-mounted cache dir (#76577).
+    // dangle inside the sandbox, so the bytes must cross via file.attach and
+    // be staged into the session workspace before prompt preprocessing.
     $connection.set({ mode: 'local' } as never)
     $terminalBackend.set('docker')
     const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
@@ -3027,8 +3027,8 @@ describe('usePromptActions file attachment sync', () => {
       if (method === 'file.attach') {
         return {
           attached: true,
-          path: '/root/.hermes/attachments/report.txt',
-          ref_text: '@file:/root/.hermes/attachments/report.txt',
+          path: '/workspace/.hermes/desktop-attachments/report.txt',
+          ref_text: '@file:.hermes/desktop-attachments/report.txt',
           uploaded: true
         } as never
       }
@@ -3056,7 +3056,14 @@ describe('usePromptActions file attachment sync', () => {
     $terminalBackend.set('')
   })
 
-  it('rejects a remote path-less @file ref containing an absolute workstation path', async () => {
+  it.each([
+    "@file:'/Users/mahmoud/Downloads/DEVIS_signed.pdf'",
+    '@file:"/Users/mahmoud/Downloads/DEVIS_signed.pdf"',
+    '@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`:1-3',
+    '  @file:   "/Users/mahmoud/Downloads/DEVIS_signed.pdf" :1-3  ',
+    '@file://server/share',
+    '@file:"C:\\Users\\alice\\Downloads\\DEVIS_signed.pdf":12'
+  ])('rejects a remote pathless absolute workstation ref: %s', async refText => {
     $connection.set({ mode: 'remote' } as never)
     const readFileDataUrl = vi.fn(async () => 'data:application/pdf;base64,JVBERi0=')
     Object.defineProperty(window, 'hermesDesktop', {
@@ -3065,10 +3072,10 @@ describe('usePromptActions file attachment sync', () => {
     })
 
     const pathlessRef: ComposerAttachment = {
-      id: 'file:devis',
+      id: `file:${refText}`,
       kind: 'file',
       label: 'DEVIS_signed.pdf',
-      refText: '@file:`/Users/mahmoud/Downloads/DEVIS_signed.pdf`'
+      refText
     }
     const requestGateway = vi.fn(async () => ({}) as never)
 
@@ -3116,7 +3123,7 @@ describe('usePromptActions file attachment sync', () => {
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 
-  it('passes a Windows path directly for a native Windows local backend', async () => {
+  it('uploads Windows path bytes for a native Windows local backend', async () => {
     $connection.set({ mode: 'local' } as never)
     $currentCwd.set('C:\\Users\\alice\\project')
     const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,c2hvdWxkLW5vdC1iZS1yZWFk')
@@ -3137,7 +3144,7 @@ describe('usePromptActions file attachment sync', () => {
       calls.push({ method, params })
 
       if (method === 'file.attach') {
-        return { attached: true, ref_text: '@file:data/report.txt', uploaded: false } as never
+        return { attached: true, ref_text: '@file:data/report.txt', uploaded: true } as never
       }
 
       return {} as never
@@ -3151,10 +3158,15 @@ describe('usePromptActions file attachment sync', () => {
     const ok = await handle!.submitText('summarize', { attachments: [attachment] })
 
     expect(ok).toBe(true)
-    expect(calls[0]?.method).toBe('file.attach')
-    expect(readFileDataUrl).not.toHaveBeenCalled()
-    // Native Windows local mode shares the same path namespace.
-    expect(calls[0]?.params).not.toHaveProperty('data_url')
+    expect(readFileDataUrl).toHaveBeenCalledWith('C:\\Users\\alice\\Downloads\\report.txt')
+    expect(calls[0]).toEqual({
+      method: 'file.attach',
+      params: {
+        data_url: 'data:text/plain;base64,c2hvdWxkLW5vdC1iZS1yZWFk',
+        name: 'report.txt',
+        session_id: RUNTIME_SESSION_ID
+      }
+    })
     expect(calls[1]).toEqual({
       method: 'prompt.submit',
       params: { session_id: RUNTIME_SESSION_ID, text: '@file:data/report.txt\n\nsummarize' }

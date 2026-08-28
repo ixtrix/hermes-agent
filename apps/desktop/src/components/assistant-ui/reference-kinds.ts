@@ -144,7 +144,46 @@ export const WIRE_REFERENCE_KINDS = ['file', 'folder', 'url', 'image', 'tool', '
  * a space — so the quoted forms are tried BEFORE bare `\S+`, or a quoted value
  * would end at the first space and strand the rest as prose.
  */
-const REFERENCE_PATTERN = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/
+const REFERENCE_PATTERN =
+  /@(file|folder|url|image|tool|line|terminal|session):[^\S\n]*(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+?)(?:[^\S\n]*:(\d+(?:-\d+)?))?(?=$|\s)/
+
+export interface ParsedReference {
+  kind: (typeof WIRE_REFERENCE_KINDS)[number]
+  lineRange?: string
+  value: string
+}
+
+/** Parse one complete wire reference using the same grammar rendered by chips. */
+export function parseReference(text: string): ParsedReference | null {
+  const match = new RegExp(`^(?:${REFERENCE_PATTERN.source})$`).exec(text.trim())
+
+  if (!match) {
+    return null
+  }
+
+  let value = match[2] || ''
+  const quote = value[0]
+
+  if ((quote === '`' || quote === '"' || quote === "'") && value.endsWith(quote)) {
+    value = value.slice(1, -1)
+  }
+
+  let lineRange = match[3]
+  if (!lineRange) {
+    const bareRange = value.match(/^(.*):(\d+(?:-\d+)?)$/)
+
+    if (bareRange) {
+      value = bareRange[1] || ''
+      lineRange = bareRange[2]
+    }
+  }
+
+  return {
+    kind: match[1] as ParsedReference['kind'],
+    ...(lineRange ? { lineRange } : {}),
+    value: value.trim()
+  }
+}
 
 /**
  * A fresh matcher for every surface that has to find references in text: the

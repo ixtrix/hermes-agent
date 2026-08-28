@@ -15,7 +15,7 @@ import { useSessionLinkTitle } from '@/lib/session-link-title'
 import { parseSessionRefValue, sessionRefFallbackLabel } from '@/lib/session-refs'
 import { cn } from '@/lib/utils'
 
-import { referenceKind, referenceRe, referenceStyle, WIRE_REFERENCE_KINDS } from './reference-kinds'
+import { parseReference, referenceKind, referenceRe, referenceStyle, WIRE_REFERENCE_KINDS } from './reference-kinds'
 
 const HERMES_REF_TYPES = WIRE_REFERENCE_KINDS
 type HermesRefType = (typeof HERMES_REF_TYPES)[number]
@@ -235,13 +235,15 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
       id: match[3] || match[2] || ''
     })),
     ...Array.from(text.matchAll(HERMES_DIRECTIVE_RE)).map(match => {
-      const id = unwrapRefValue(match[2] || '')
+      const parsed = parseReference(match[0])
+      const type = parsed?.kind || match[1] || 'file'
+      const id = parsed?.value || unwrapRefValue(match[2] || '')
 
       return {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,
-        type: match[1] || 'file',
-        label: refChipLabel(match[1] || 'file', id),
+        type,
+        label: refChipLabel(type, id),
         id
       }
     }),
