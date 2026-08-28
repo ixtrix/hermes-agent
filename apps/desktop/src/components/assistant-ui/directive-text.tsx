@@ -212,6 +212,11 @@ export const hermesDirectiveFormatter: Unstable_DirectiveFormatter = {
 
       return `@${kind}:${formatRefValue(insertId)}`
     }
+    // Parsed quoted file ranges keep their canonical wire value in `id` so
+    // the range remains outside the closing quote across editor hydration.
+    if (item.id.startsWith(`@${item.type}:`) && parseReference(item.id)) {
+      return item.id
+    }
 
     // Fallback for legacy callers that pass raw `id` strings.
     if (item.id === `${item.type}:`) {
@@ -238,13 +243,15 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
       const parsed = parseReference(match[0])
       const type = parsed?.kind || match[1] || 'file'
       const baseId = parsed?.value || unwrapRefValue(match[2] || '')
-      const id = parsed?.lineRange ? `${baseId}:${parsed.lineRange}` : baseId
+      const targetId = parsed?.lineRange ? `${baseId}:${parsed.lineRange}` : baseId
+      const id =
+        parsed?.quoted && parsed.lineRange ? `@${type}:${formatRefValue(baseId)}:${parsed.lineRange}` : targetId
 
       return {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,
         type,
-        label: refChipLabel(type, id),
+        label: refChipLabel(type, targetId),
         id
       }
     }),
@@ -546,13 +553,23 @@ const SlashChip: FC<{ kind: SlashChipKind; label: string; value: string }> = ({ 
  *  entry (a url, …) renders as a real button that runs it on click; everything
  *  else is inert text. `onClick` overrides for chips that resolve their target
  *  themselves (session, which needs the async navigator). */
+function directiveTargetId(type: string, id: string): string {
+  if (!id.startsWith(`@${type}:`)) {
+    return id
+  }
+
+  const parsed = parseReference(id)
+  return parsed?.lineRange ? `${parsed.value}:${parsed.lineRange}` : parsed?.value || id
+}
+
 const DirectiveChip: FC<{
   type: string
   label: string
   id: string
   onClick?: () => void
 }> = ({ type, label, id, onClick }) => {
-  const activate = onClick ?? (DIRECTIVE_ACTIONS[type] ? () => DIRECTIVE_ACTIONS[type]!.run(id) : undefined)
+  const targetId = directiveTargetId(type, id)
+  const activate = onClick ?? (DIRECTIVE_ACTIONS[type] ? () => DIRECTIVE_ACTIONS[type]!.run(targetId) : undefined)
 
   const body = (
     <>
@@ -563,9 +580,9 @@ const DirectiveChip: FC<{
 
   const props = {
     ...refAttrs(type, cn('wrap-anywhere', activate && 'cursor-pointer')),
-    'data-directive-id': id,
+    'data-directive-id': targetId,
     'data-slot': 'aui_directive-chip',
-    title: id
+    title: targetId
   }
 
   return activate ? (

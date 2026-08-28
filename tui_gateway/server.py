@@ -12726,8 +12726,15 @@ def _sanitize_attachment_name(name: str) -> str:
 
     candidate = Path(str(name or "").strip()).name
     candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
-    candidate = _re.sub(r":(?=\d+(?:-\d+)?$)", "_", candidate)
     candidate = candidate.strip().strip(".")
+    candidate = candidate.rstrip(",.;!?")
+    while candidate.endswith((")", "]", "}")):
+        closer = candidate[-1]
+        opener = {")": "(", "]": "[", "}": "{"}[closer]
+        if candidate.count(closer) <= candidate.count(opener):
+            break
+        candidate = candidate[:-1]
+    candidate = _re.sub(r":(?=\d+(?:-\d+)?$)", "_", candidate)
     return candidate or "attachment"
 
 
@@ -12850,6 +12857,13 @@ def _resolve_gateway_attachment_path(raw: str) -> Path | None:
 
     if os.name == "nt":
         from urllib.parse import unquote, urlparse
+        direct = _resolve_attachment_path(raw)
+        if direct is not None:
+            return Path(direct)
+        dropped = _detect_file_drop(raw)
+        if dropped:
+            return Path(dropped["path"])
+
 
         path_token, _remainder = _split_path_input(raw)
         expanded = path_token

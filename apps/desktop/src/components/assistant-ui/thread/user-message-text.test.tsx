@@ -48,6 +48,20 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(screen.queryByTitle('src/a.ts:12')).not.toBeNull()
   })
 
+  it('keeps a quoted range-shaped filename literal', () => {
+    expect(parseReference('@file:"reports/report:12"')).toEqual({
+      kind: 'file',
+      quoted: true,
+      value: 'reports/report:12'
+    })
+  })
+
+  it('preserves a quoted file range in the rendered chip target', () => {
+    render(<UserMessageText text="open @file:`src/my notes.ts`:12 now" />)
+
+    expect(screen.queryByTitle('src/my notes.ts:12')).not.toBeNull()
+  })
+
   it('chips a backtick-quoted @file: path with spaces', () => {
     render(<UserMessageText text="see @file:`apps/desktop/my notes.md` please" />)
 

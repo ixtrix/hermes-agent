@@ -50,6 +50,22 @@ describe('hermesDirectiveFormatter.parse', () => {
     ).toBe('@file:src/a.ts:12')
   })
 
+  it('serializes a quoted file line range after the closing quote', () => {
+    const [segment] = hermesDirectiveFormatter.parse('@file:`src/my notes.ts`:12')
+
+    expect(segment).toEqual(
+      expect.objectContaining({
+        kind: 'mention',
+        type: 'file',
+        label: 'src/my notes.ts:12',
+        id: '@file:`src/my notes.ts`:12'
+      })
+    )
+    expect(segment.kind === 'mention' ? hermesDirectiveFormatter.serialize(segment) : '').toBe(
+      '@file:`src/my notes.ts`:12'
+    )
+  })
+
   it('parses session links with profile/id values', () => {
     const segments = hermesDirectiveFormatter.parse('see @session:work/20260101_abc123 next')
 

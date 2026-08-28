@@ -10494,6 +10494,41 @@ def test_file_attach_snapshots_workspace_file_on_windows(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+@pytest.mark.windows_only
+def test_file_attach_resolves_unquoted_relative_windows_path_with_spaces(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    source = workspace / "data" / "quarterly report.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("sku,qty\nA,2\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": str(Path("data") / "quarterly report.csv"),
+                },
+            }
+        )
+
+        stored = (
+            workspace
+            / ".hermes"
+            / "desktop-attachments"
+            / "quarterly report.csv"
+        )
+        assert resp["result"]["path"] == str(stored)
+        assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 
 @pytest.mark.linux_only
 def test_file_attach_rejects_symlinked_workspace_staging_directory(
@@ -10573,8 +10608,18 @@ def test_file_attach_uploaded_pdf_becomes_model_context(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
-def test_file_attach_range_shaped_name_remains_preprocessable(monkeypatch, tmp_path):
-    """A filename ending in :digits must not be mistaken for a source line range."""
+@pytest.mark.parametrize(
+    ("name", "stored_name"),
+    [
+        ("report:3000", "report_3000"),
+        ("report:3000.", "report_3000"),
+        ("report:3000,", "report_3000"),
+    ],
+)
+def test_file_attach_range_shaped_name_remains_preprocessable(
+    monkeypatch, tmp_path, name, stored_name
+):
+    """Range-shaped filenames remain unambiguous after punctuation cleanup."""
     from agent.context_references import preprocess_context_references
 
     workspace = tmp_path / "workspace"
@@ -10588,7 +10633,7 @@ def test_file_attach_range_shaped_name_remains_preprocessable(monkeypatch, tmp_p
                 "method": "file.attach",
                 "params": {
                     "session_id": "sid",
-                    "name": "report:3000",
+                    "name": name,
                     "data_url": "data:text/plain;base64,cmFuZ2Ugc2FmZSBjb250ZW50",
                 },
             }
@@ -10601,7 +10646,7 @@ def test_file_attach_range_shaped_name_remains_preprocessable(monkeypatch, tmp_p
             context_length=100_000,
         )
 
-        assert ref_text == "@file:.hermes/desktop-attachments/report_3000"
+        assert ref_text == f"@file:.hermes/desktop-attachments/{stored_name}"
         assert context.warnings == []
         assert context.expanded is True
         assert "range safe content" in context.message
@@ -10676,6 +10721,7 @@ def test_file_attach_rejects_gateway_visible_file_outside_workspace(monkeypatch,
         server._sessions.pop("sid", None)
 
 
+@pytest.mark.require_symlinks
 def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

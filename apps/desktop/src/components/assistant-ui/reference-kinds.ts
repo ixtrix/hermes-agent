@@ -149,6 +149,7 @@ const REFERENCE_PATTERN =
 
 export interface ParsedReference {
   kind: (typeof WIRE_REFERENCE_KINDS)[number]
+  quoted?: boolean
   lineRange?: string
   value: string
 }
@@ -164,8 +165,9 @@ export function parseReference(text: string): ParsedReference | null {
   const kind = match[1] as ParsedReference['kind']
   let value = match[2] || ''
   const quote = value[0]
+  const quoted = (quote === '`' || quote === '"' || quote === "'") && value.endsWith(quote)
 
-  if ((quote === '`' || quote === '"' || quote === "'") && value.endsWith(quote)) {
+  if (quoted) {
     value = value.slice(1, -1)
   }
 
@@ -173,7 +175,7 @@ export function parseReference(text: string): ParsedReference | null {
   if (lineRange && kind !== 'file') {
     value = `${value}:${lineRange}`
     lineRange = undefined
-  } else if (!lineRange && kind === 'file') {
+  } else if (!lineRange && kind === 'file' && !quoted) {
     const bareRange = value.match(/^(.*):(\d+(?:-\d+)?)$/)
 
     if (bareRange) {
@@ -184,6 +186,7 @@ export function parseReference(text: string): ParsedReference | null {
 
   return {
     kind,
+    ...(quoted ? { quoted: true } : {}),
     ...(lineRange ? { lineRange } : {}),
     value: value.trim()
   }
