@@ -96,6 +96,11 @@ function isAbsoluteDesktopPath(path: string): boolean {
   return ABSOLUTE_DESKTOP_PATH_RE.test(path.trim())
 }
 
+function isSessionOwnedFileRef(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/').replace(/^(?:\.\/)+/, '')
+  return normalized === '.hermes/desktop-attachments' || normalized.startsWith('.hermes/desktop-attachments/')
+}
+
 export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachment): void {
   if (!['file', 'folder', 'image'].includes(attachment.kind) || (attachment.path && attachment.kind !== 'folder')) {
     return
@@ -140,7 +145,10 @@ export async function uploadComposerAttachment(
   }
 ): Promise<ComposerAttachment> {
   const { requestGateway, storedSessionId, onSessionRecovered } = opts
-  const path = attachment.kind === 'image' ? attachment.sourcePath || attachment.path || '' : attachment.path || ''
+  const path =
+    attachment.kind === 'image' || attachment.kind === 'file'
+      ? attachment.sourcePath || attachment.path || ''
+      : attachment.path || ''
   const label = attachment.label || pathLabel(path)
   const uploadBytes = isAbsoluteDesktopPath(path)
 
@@ -166,6 +174,10 @@ export async function uploadComposerAttachment(
     if (attachment.kind === 'image' ? !imagePayload : !fileDataUrl) {
       throw new Error(`Could not read ${label}`)
     }
+  }
+
+  if (attachment.kind === 'file' && !attachment.sourcePath && isSessionOwnedFileRef(path)) {
+    throw new Error(`Could not attach ${label}: session-owned file ref has no authoritative source`)
   }
 
   const stageForSession = async (liveSessionId: string): Promise<ComposerAttachment> => {
@@ -230,6 +242,7 @@ export async function uploadComposerAttachment(
       label: pathLabel(attachedPath),
       path: attachedPath,
       refText: result.ref_text,
+      sourcePath: attachment.sourcePath || path,
       uploadState: undefined
     }
   }

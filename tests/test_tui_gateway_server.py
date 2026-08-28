@@ -10928,6 +10928,59 @@ def test_file_attach_forged_unregistered_reserved_ref_fails_closed(
     ]
 
 
+def test_file_attach_absolute_unregistered_reserved_ref_fails_closed(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    forged = workspace / ".hermes" / "desktop-attachments" / "forged.txt"
+    forged.parent.mkdir(parents=True)
+    forged.write_text("absolute forged bytes", encoding="utf-8")
+    session = _session(cwd=str(workspace))
+
+    context = preprocess_context_references(
+        f"Review @file:{forged}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+        trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+            session, target
+        ),
+    )
+
+    assert "absolute forged bytes" not in context.message
+    assert context.warnings
+    assert "not registered for this session" in context.warnings[0]
+
+
+@pytest.mark.macos_only
+def test_file_attach_symlink_alias_to_unregistered_reserved_ref_fails_closed(
+    tmp_path,
+):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    forged = reserved / "forged.txt"
+    forged.write_text("aliased forged bytes", encoding="utf-8")
+    (workspace / "attachment-alias").symlink_to(reserved, target_is_directory=True)
+    session = _session(cwd=str(workspace))
+
+    context = preprocess_context_references(
+        "Review @file:attachment-alias/forged.txt",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+        trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+            session, target
+        ),
+    )
+
+    assert "aliased forged bytes" not in context.message
+    assert context.warnings
+    assert "not registered for this session" in context.warnings[0]
+
+
 def test_file_attach_registry_loss_after_restart_fails_closed(tmp_path):
     from agent.context_references import preprocess_context_references
 

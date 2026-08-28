@@ -12549,12 +12549,16 @@ def _trusted_session_attachment_opener(session: dict, target: str):
     digest = hashlib.sha256()
     size = 0
     try:
-        while chunk := source.read(1024 * 1024):
-            snapshot.write(chunk)
-            digest.update(chunk)
-            size += len(chunk)
-    finally:
-        source.close()
+        try:
+            while chunk := source.read(1024 * 1024):
+                snapshot.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        finally:
+            source.close()
+    except Exception:
+        snapshot.close()
+        raise
     if size != registered.size or digest.hexdigest() != registered.sha256:
         snapshot.close()
         raise ValueError("session-owned attachment bytes changed after staging")

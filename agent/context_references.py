@@ -408,7 +408,18 @@ def _expand_file_reference(
         )
 
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
+    attachment_root = (cwd.resolve() / _SESSION_ATTACHMENT_REF_ROOT).resolve()
+    try:
+        path.relative_to(attachment_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "session-owned attachment reference is not registered for this session"
+        )
+
     _ensure_reference_path_allowed(path)
+
     if not path.exists():
         return f"{ref.raw}: file not found", None
     if not path.is_file():

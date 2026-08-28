@@ -253,7 +253,7 @@ describe('click-to-edit user message', () => {
     } as unknown as DataTransfer
     const request = vi.fn(async (method: string) => {
       if (method === 'image.attach_bytes') {
-        return { attached: true, path: sessionPath }
+        return { attached: true, path: '/profile/images/photo.png', ref_path: sessionPath }
       }
 
       return {}
@@ -348,7 +348,7 @@ describe('click-to-edit user message', () => {
         expect($notifications.get()).toEqual([
           expect.objectContaining({
             kind: 'error',
-            message: expect.stringContaining('gateway returned no session-owned image path')
+            message: expect.stringContaining('gateway returned no session-owned image ref')
           })
         ])
       )

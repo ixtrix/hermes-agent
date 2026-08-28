@@ -2718,6 +2718,82 @@ describe('usePromptActions file attachment sync', () => {
     })
   })
 
+  it('re-uploads authoritative file source bytes across sessions instead of resolving the stale staged ref', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,YXV0aG9yaXRhdGl2ZQ==')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    let attachCount = 0
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method !== 'file.attach') {
+        return {} as never
+      }
+
+      attachCount += 1
+      const name = attachCount === 1 ? 'report.txt' : 'report-2.txt'
+      return {
+        attached: true,
+        ref_text: `@file:.hermes/desktop-attachments/${name}`,
+        uploaded: true
+      } as never
+    })
+
+    const first = await uploadComposerAttachment(fileAttachment(), {
+      requestGateway,
+      sessionId: 'runtime-a'
+    })
+    const second = await uploadComposerAttachment(first, {
+      requestGateway,
+      sessionId: 'runtime-b'
+    })
+
+    expect(first).toMatchObject({
+      attachedSessionId: 'runtime-a',
+      detail: '.hermes/desktop-attachments/report.txt',
+      path: '.hermes/desktop-attachments/report.txt',
+      refText: '@file:.hermes/desktop-attachments/report.txt',
+      sourcePath: '/Users/alice/Downloads/report.txt'
+    })
+    expect(second).toMatchObject({
+      attachedSessionId: 'runtime-b',
+      detail: '.hermes/desktop-attachments/report-2.txt',
+      path: '.hermes/desktop-attachments/report-2.txt',
+      refText: '@file:.hermes/desktop-attachments/report-2.txt',
+      sourcePath: '/Users/alice/Downloads/report.txt'
+    })
+    expect(readFileDataUrl).toHaveBeenCalledTimes(2)
+    expect(readFileDataUrl).toHaveBeenNthCalledWith(1, '/Users/alice/Downloads/report.txt')
+    expect(readFileDataUrl).toHaveBeenNthCalledWith(2, '/Users/alice/Downloads/report.txt')
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'file.attach', {
+      data_url: 'data:text/plain;base64,YXV0aG9yaXRhdGl2ZQ==',
+      name: 'report.txt',
+      session_id: 'runtime-b'
+    })
+  })
+
+  it('rejects a stale session-owned file ref when no authoritative source remains', async () => {
+    const requestGateway = vi.fn()
+
+    await expect(
+      uploadComposerAttachment(
+        {
+          attachedSessionId: 'runtime-a',
+          detail: '.hermes/desktop-attachments/report.txt',
+          id: 'file:report.txt',
+          kind: 'file',
+          label: 'report.txt',
+          path: '.hermes/desktop-attachments/report.txt',
+          refText: '@file:.hermes/desktop-attachments/report.txt'
+        },
+        { requestGateway, sessionId: 'runtime-b' }
+      )
+    ).rejects.toThrow('session-owned file ref has no authoritative source')
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
   it('uploads an absolute POSIX file in local mode instead of passing an outside-workspace path', async () => {
     $connection.set({ mode: 'local' } as never)
     $currentCwd.set('/Users/alice/project')
