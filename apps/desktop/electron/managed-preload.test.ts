@@ -13,7 +13,8 @@ vi.mock('electron', () => ({
     invoke: mocks.invoke,
     on: vi.fn(),
     removeListener: vi.fn(),
-    send: vi.fn()
+    send: vi.fn(),
+    sendSync: vi.fn()
   },
   webUtils: { getPathForFile: vi.fn() }
 }))

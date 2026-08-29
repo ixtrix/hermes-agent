@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, safeStorage, session, shell, type WebContents } from 'electron'
 
 import { buildGatewayWsUrlWithTicket, normalizeRemoteBaseUrl } from './connection-config'
+import { registerWorkstationFoldersIpc } from './fs-ipc'
 import { ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES, resolveReadableFileForIpc } from './hardening'
 import { MANAGED_PRODUCT_PROTOCOLS, managedProductPolicy, managedUserDataRoot } from './managed-product'
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse, tokenNeedsRefresh } from './native-oauth'
@@ -424,6 +425,15 @@ function connectionConfig() {
 }
 
 function installIpc() {
+  registerWorkstationFoldersIpc({
+    plane: PRODUCT.plane,
+    roots: {
+      desktop: app.getPath('desktop'),
+      documents: app.getPath('documents'),
+      downloads: app.getPath('downloads')
+    },
+    trashItem: targetPath => shell.trashItem(targetPath)
+  })
   ipcMain.handle('hermes:boot-progress:get', () => bootProgress)
   ipcMain.handle('hermes:connection', () => ensureConnection())
   ipcMain.handle('hermes:connection:revalidate', async () => {

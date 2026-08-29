@@ -363,6 +363,17 @@ export function createWorkstationFoldersHandler({
     throw new Error('Unsupported workstation folder operation')
   }
 }
+export function registerWorkstationFoldersIpc(deps: WorkstationFoldersHandlerDeps): boolean {
+  if (deps.plane !== 'internal') {
+    return false
+  }
+  const workstationFolders = createWorkstationFoldersHandler(deps)
+
+  ipcMain.handle('hermes:workstationFolders', async (_event, op, payload) => workstationFolders(op, payload))
+
+  return true
+}
+
 
 export function registerFsIpc({
   hermesHome,
@@ -372,7 +383,7 @@ export function registerFsIpc({
   directoryExists,
   resolveGitBinary
 }: FsIpcDeps) {
-  const workstationFolders = createWorkstationFoldersHandler({
+  registerWorkstationFoldersIpc({
     plane: managedProductPlane,
     roots: {
       desktop: app.getPath('desktop'),
@@ -381,8 +392,6 @@ export function registerFsIpc({
     },
     trashItem: targetPath => shell.trashItem(targetPath)
   })
-
-  ipcMain.handle('hermes:workstationFolders', async (_event, op, payload) => workstationFolders(op, payload))
 
   ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
 

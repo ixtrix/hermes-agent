@@ -28,13 +28,7 @@ import {
   type SessionOwnerScope,
   type SessionProfileRoute
 } from '@/store/session-request-router'
-import {
-  $sessionStates,
-  isSessionRemote,
-  patchSessionTile,
-  sessionTileDelegate,
-  sessionTileOwnerRoute
-} from '@/store/session-states'
+import { $sessionStates, patchSessionTile, sessionTileDelegate, sessionTileOwnerRoute } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -219,7 +213,6 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
-      const remote = isSessionRemote(storedIdRef.current ?? sessionId)
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
@@ -246,8 +239,6 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
           const next = await uploadComposerAttachment(attachment, {
-            backendCwd: readState()?.cwd,
-            remote,
             requestGateway: requestSessionGateway,
             sessionId: liveSessionId,
             storedSessionId: storedIdRef.current,

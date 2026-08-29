@@ -34,7 +34,6 @@ import {
   $busy,
   $connection,
   $messages,
-  $terminalBackend,
   getSessionOwnerHint,
   setActiveSessionId,
   setAwaitingResponse,
@@ -42,7 +41,7 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
-import { $sessionStates, isSessionRemote } from '@/store/session-states'
+import { $sessionStates } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -119,7 +118,7 @@ export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachm
   const rawRefPath = refText
     .trim()
     .replace(/^@(file|folder|image):[^\S\n]*/, '')
-    .replace(/^[\s"'`(\[{<]+/, '')
+    .replace(/^[\s"'`([{<]+/, '')
 
   if (
     (refPath && isAbsoluteDesktopPath(refPath)) ||
@@ -145,7 +144,7 @@ export function assertManagedAttachmentStateCoherent(attachment: ComposerAttachm
   const rawRefPath = refText
     .trim()
     .replace(/^@(file|image):[^\S\n]*/, '')
-    .replace(/^[\s"'`(\[{<]+/, '')
+    .replace(/^[\s"'`([{<]+/, '')
 
   if (
     !path ||
@@ -179,14 +178,14 @@ export async function uploadComposerAttachment(
     onSessionRecovered?: (sessionId: string) => void
   }
 ): Promise<ComposerAttachment> {
-  const { backendCwd, remote, requestGateway, sessionId, storedSessionId, onSessionRecovered, terminalBackend } = opts
+  const { requestGateway, sessionId, storedSessionId, onSessionRecovered } = opts
   const path =
     attachment.kind === 'image' || attachment.kind === 'file'
       ? attachment.sourcePath || attachment.path || ''
       : attachment.path || ''
   const label = attachment.label || pathLabel(path)
 
-  const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
+  const uploadBytes = isAbsoluteDesktopPath(path)
   if (isManagedProductBuild) {
     const bytes = attachment.bytes
 
@@ -520,7 +519,6 @@ export function usePromptActions({
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
       const storedSessionId = selectedStoredSessionIdRef.current
-      const remote = isSessionRemote(storedSessionId ?? sessionId)
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
@@ -550,10 +548,6 @@ export function usePromptActions({
         assertAttachmentCanSubmitWithoutPath(attachment)
         assertManagedAttachmentStateCoherent(attachment)
 
-        if (!attachment.path) {
-          synced.push(attachment)
-          continue
-        }
 
         const managedAttachable =
           isManagedProductBuild &&
@@ -624,7 +618,6 @@ export function usePromptActions({
   // image.attach_bytes.
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
-      const remote = isSessionRemote(sessionId)
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
       try {

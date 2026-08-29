@@ -66,7 +66,7 @@ test('managed and ordinary Electron bundles select isolated entrypoints and exte
 
   const ordinary = electronBundlePlan('')
   assert.equal(path.basename(ordinary.mainEntry), 'main.ts')
-  assert.deepEqual(ordinary.external, ['electron', 'node-pty', 'fs'])
+  assert.deepEqual(ordinary.external, ['electron', 'node-pty', 'get-windows', 'fs'])
 })
 
 test('renderer compile-time defines reject loopback authorities and select managed policy', () => {

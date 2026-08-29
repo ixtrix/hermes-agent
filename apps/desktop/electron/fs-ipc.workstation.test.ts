@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+import { ipcMain } from 'electron'
 import { afterEach, test, vi } from 'vitest'
 
 vi.mock('electron', () => ({
@@ -11,7 +12,7 @@ vi.mock('electron', () => ({
   shell: { openPath: vi.fn(), showItemInFolder: vi.fn(), trashItem: vi.fn() }
 }))
 
-import { createWorkstationFoldersHandler } from './fs-ipc'
+import { createWorkstationFoldersHandler, registerWorkstationFoldersIpc } from './fs-ipc'
 
 const rootsToRemove: string[] = []
 
@@ -41,6 +42,21 @@ afterEach(() => {
   while (rootsToRemove.length > 0) {
     fs.rmSync(rootsToRemove.pop()!, { recursive: true, force: true })
   }
+})
+
+test('managed main registers workstation folders only for the Internal plane', () => {
+  const handle = vi.mocked(ipcMain.handle)
+  const deps = {
+    roots: { desktop: '/desktop', documents: '/documents', downloads: '/downloads' },
+    trashItem: vi.fn(async () => undefined)
+  }
+
+  handle.mockClear()
+  assert.equal(registerWorkstationFoldersIpc({ ...deps, plane: 'external' }), false)
+  assert.equal(handle.mock.calls.length, 0)
+  assert.equal(registerWorkstationFoldersIpc({ ...deps, plane: 'internal' }), true)
+  assert.equal(handle.mock.calls.length, 1)
+  assert.equal(handle.mock.calls[0]?.[0], 'hermes:workstationFolders')
 })
 
 test('workstation folders fail closed outside the Internal managed product', async () => {
