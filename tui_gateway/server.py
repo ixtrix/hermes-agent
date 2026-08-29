@@ -12561,6 +12561,9 @@ def _run_prompt_submit(
                     cwd=cwd,
                     allowed_root=cwd,
                     context_length=ctx_len,
+                    trusted_file_opener=lambda target: _trusted_session_attachment_opener(
+                        session, target
+                    ),
                 )
                 if ctx.blocked:
                     _emit(
@@ -13524,32 +13527,373 @@ def _format_ref_value(value: str) -> str:
     return value
 
 
-def _attachment_ref_path(session: dict, target: Path) -> str:
-    """Workspace-relative path for an attachment, or the absolute path if outside."""
-    workspace = Path(_session_cwd(session)).resolve()
+class _ObservedAttachmentPath(NamedTuple):
+    workspace: Path
+    path: Path
+    identities: tuple[tuple[int, int], ...]
+class _RegisteredAttachment(NamedTuple):
+    observed: _ObservedAttachmentPath
+    size: int
+    sha256: str
+
+
+
+
+class _StagedAttachment(NamedTuple):
+    path: Path
+    ref_path: str
+    uploaded: bool
+    observed: _ObservedAttachmentPath
+
+
+def _attachment_stat_identity(info) -> tuple[int, int]:
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _observe_workspace_attachment_path(
+    workspace: Path, path: Path
+) -> _ObservedAttachmentPath:
     try:
-        rel = target.resolve().relative_to(workspace)
-        return str(rel).replace(os.sep, "/")
-    except ValueError:
-        return str(target.resolve())
+        relative = path.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError("gateway file is outside the session workspace") from exc
+    if relative == Path(".") or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("gateway file is not a safe workspace path")
+
+    current = workspace
+    identities = [_attachment_stat_identity(current.lstat())]
+    for component in relative.parts:
+        current /= component
+        identities.append(_attachment_stat_identity(current.lstat()))
+    return _ObservedAttachmentPath(workspace, path, tuple(identities))
 
 
-def _desktop_attachment_dir(session: dict) -> Path:
-    """Resolve the file-attachment staging dir against the session's effective home.
+def _assert_attachment_identity(info, expected: tuple[int, int]) -> None:
+    if _attachment_stat_identity(info) != expected:
+        raise ValueError("gateway file changed or is not a safe workspace file")
 
-    Anchored on the session profile's ``attachments/`` dir (same rule as
-    ``_session_images_dir``): ``file.attach`` runs BEFORE ``prompt.submit``
-    installs the session's profile HERMES_HOME override, while the docker/ssh
-    sandbox mounts are resolved against the *session profile's* home at run
-    time — so the staged file must land where the bind mount points, or the
-    container can never see it (#76577). ``attachments/`` is registered in
-    ``tools.credential_files._CACHE_DIRS`` and auto-mounted into containers.
+
+def _assert_attachment_path_identities(observed: _ObservedAttachmentPath) -> None:
+    current = observed.workspace
+    _assert_attachment_identity(current.lstat(), observed.identities[0])
+    relative = observed.path.relative_to(observed.workspace)
+    for component, identity in zip(relative.parts, observed.identities[1:]):
+        current /= component
+        _assert_attachment_identity(current.lstat(), identity)
+
+
+def _trusted_session_attachment_opener(session: dict, target: str):
+    import hashlib
+    import tempfile
+
+    registered = session.get("_trusted_file_attachments", {}).get(target)
+    if registered is None:
+        return None
+    source = _open_workspace_attachment_no_follow(registered.observed)
+    snapshot = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        try:
+            while chunk := source.read(1024 * 1024):
+                snapshot.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        finally:
+            source.close()
+    except Exception:
+        snapshot.close()
+        raise
+    if size != registered.size or digest.hexdigest() != registered.sha256:
+        snapshot.close()
+        raise ValueError("session-owned attachment bytes changed after staging")
+    snapshot.flush()
+    snapshot.seek(0)
+    return snapshot
+
+
+def _attachment_ref_path(target: Path) -> str:
+    """Return the descriptor-staged attachment's fixed workspace-relative ref.
+
+    ``target`` is created below ``.hermes/desktop-attachments`` through the
+    already-open workspace descriptor. Re-resolving the session's lexical cwd
+    here can disagree with that canonical root when the cwd is a symlink alias
+    and would leak an absolute gateway path.
     """
-    profile_home = session.get("profile_home")
-    base = Path(profile_home) if profile_home else _hermes_home
-    root = base / "attachments"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return f".hermes/desktop-attachments/{target.name}"
+
+
+def _windows_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _windows_final_path(fd: int) -> Path:
+    """Return the normalized DOS path held by an already-open Windows handle."""
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    get_final_path = getattr(ctypes, "WinDLL")(
+        "kernel32", use_last_error=True
+    ).GetFinalPathNameByHandleW
+    get_final_path.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    get_final_path.restype = wintypes.DWORD
+    handle = wintypes.HANDLE(getattr(msvcrt, "get_osfhandle")(fd))
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = get_final_path(handle, buffer, len(buffer), 0)
+    if not length:
+        raise OSError(getattr(ctypes, "get_last_error")(), "GetFinalPathNameByHandleW failed")
+    if length >= len(buffer):
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        length = get_final_path(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise OSError(
+                getattr(ctypes, "get_last_error")(),
+                "GetFinalPathNameByHandleW failed",
+            )
+
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _assert_windows_handle_path(
+    fd: int, workspace: Path, *, expected: Path | None = None
+) -> None:
+    final_path = _windows_final_path(fd)
+    workspace_key = _windows_path_key(workspace)
+    final_key = _windows_path_key(final_path)
+    try:
+        contained = os.path.commonpath((workspace_key, final_key)) == workspace_key
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError("gateway file is outside the session workspace")
+    if expected is not None and final_key != _windows_path_key(expected):
+        raise ValueError("gateway file changed or is not a safe workspace file")
+
+
+def _require_plain_windows_directory(path: Path) -> None:
+    import stat as _stat
+
+    info = path.lstat()
+    reparse_flag = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not _stat.S_ISDIR(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & reparse_flag
+    ):
+        raise ValueError("session attachment directory is not a safe directory")
+
+def _windows_relative_path(workspace: Path, path: Path) -> Path:
+    workspace_key = _windows_path_key(workspace)
+    path_key = _windows_path_key(path)
+    try:
+        if os.path.commonpath((workspace_key, path_key)) != workspace_key:
+            raise ValueError
+        relative = Path(os.path.relpath(str(path), str(workspace)))
+    except ValueError as exc:
+        raise ValueError("gateway file is outside the session workspace") from exc
+    if relative == Path(".") or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("gateway file is not a safe workspace path")
+    return relative
+
+
+def _require_plain_windows_file(workspace: Path, path: Path) -> None:
+    import stat as _stat
+
+    relative = _windows_relative_path(workspace, path)
+    current = workspace
+    for component in relative.parts[:-1]:
+        current /= component
+        _require_plain_windows_directory(current)
+    info = path.lstat()
+    reparse_flag = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not _stat.S_ISREG(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & reparse_flag
+    ):
+        raise ValueError("gateway file is not a safe regular file")
+
+
+def _prepare_windows_attachment_dir(session: dict) -> tuple[Path, Path]:
+    """Create and verify the Windows staging directory without reparse points."""
+    workspace = Path(os.path.abspath(_session_cwd(session)))
+    _require_plain_windows_directory(workspace)
+    current = workspace
+    for component in (".hermes", "desktop-attachments"):
+        current /= component
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        _require_plain_windows_directory(current)
+    return workspace, current
+
+
+def _open_workspace_attachment_windows(observed: _ObservedAttachmentPath):
+    """Open the observed Windows file and reject identity or parent changes."""
+    import stat as _stat
+
+    fd: int | None = None
+    try:
+        _assert_attachment_path_identities(observed)
+        _require_plain_windows_file(observed.workspace, observed.path)
+        fd = os.open(
+            observed.path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+        info = os.fstat(fd)
+        if not _stat.S_ISREG(info.st_mode):
+            raise ValueError("gateway file is not a regular file")
+        _assert_attachment_identity(info, observed.identities[-1])
+        _assert_windows_handle_path(
+            fd, observed.workspace, expected=observed.path
+        )
+        _assert_attachment_path_identities(observed)
+        opened = os.fdopen(fd, "rb")
+        fd = None
+        return opened
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "gateway file changed or is not a safe regular file in the session workspace"
+        ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+def _write_attachment_stream(target, *, payload: bytes | None, source) -> tuple[int, str]:
+    import hashlib
+
+    digest = hashlib.sha256()
+    size = 0
+    if source is not None:
+        while chunk := source.read(1024 * 1024):
+            target.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    else:
+        content = payload or b""
+        target.write(content)
+        digest.update(content)
+        size = len(content)
+    return size, digest.hexdigest()
+
+
+
+
+
+
+def _write_unique_attachment_windows(
+    workspace: Path,
+    root: Path,
+    filename: str,
+    *,
+    reserved_names: set[str],
+    payload: bytes | None = None,
+    source=None,
+) -> tuple[Path, int, int, str]:
+    """Exclusively create a Windows attachment and keep its verified handle open."""
+    stem = Path(filename).stem or "attachment"
+    suffix = Path(filename).suffix
+    counter = 1
+    while True:
+        candidate_name = filename if counter == 1 else f"{stem}-{counter}{suffix}"
+        if candidate_name in reserved_names:
+            counter += 1
+            continue
+        candidate = root / candidate_name
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            break
+        except FileExistsError:
+            counter += 1
+
+    try:
+        _assert_windows_handle_path(fd, workspace, expected=candidate)
+        with os.fdopen(fd, "wb", closefd=False) as target:
+            size, sha256 = _write_attachment_stream(
+                target, payload=payload, source=source
+            )
+        return candidate, fd, size, sha256
+    except Exception:
+        os.close(fd)
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextlib.contextmanager
+def _open_desktop_attachment_dir(session: dict):
+    """Open the parser-admitted workspace store without following symlinks."""
+    import stat as _stat
+
+    if os.name == "nt":
+        raise ValueError(
+            "secure workspace attachment staging is unavailable on Windows gateways"
+        )
+
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+        or os.mkdir not in os.supports_dir_fd
+    ):
+        raise ValueError(
+            "secure workspace attachment staging is unavailable on this gateway"
+        )
+
+    workspace = Path(_session_cwd(session)).resolve()
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    )
+    directory_fds: list[int] = []
+    try:
+        current_fd = os.open(workspace, directory_flags)
+        directory_fds.append(current_fd)
+        identities = [_attachment_stat_identity(os.fstat(current_fd))]
+        for component in (".hermes", "desktop-attachments"):
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            try:
+                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise ValueError(
+                    "session attachment directory is not a safe directory"
+                ) from exc
+            info = os.fstat(current_fd)
+            if not _stat.S_ISDIR(info.st_mode):
+                os.close(current_fd)
+                raise ValueError(
+                    "session attachment directory is not a safe directory"
+                )
+            directory_fds.append(current_fd)
+            identities.append(_attachment_stat_identity(info))
+
+        yield (
+            workspace,
+            workspace / ".hermes" / "desktop-attachments",
+            current_fd,
+            tuple(identities),
+        )
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
 
 
 def _sanitize_attachment_name(name: str) -> str:
@@ -13558,38 +13902,223 @@ def _sanitize_attachment_name(name: str) -> str:
     candidate = Path(str(name or "").strip()).name
     candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
     candidate = candidate.strip().strip(".")
+    candidate = candidate.rstrip(",.;!?")
+    while candidate.endswith((")", "]", "}")):
+        closer = candidate[-1]
+        opener = {")": "(", "]": "[", "}": "{"}[closer]
+        if candidate.count(closer) <= candidate.count(opener):
+            break
+        candidate = candidate[:-1]
+    candidate = _re.sub(r":(?=\d+(?:-\d+)?$)", "_", candidate)
     return candidate or "attachment"
 
 
-def _unique_attachment_path(root: Path, filename: str) -> Path:
-    candidate = root / filename
-    if not candidate.exists():
-        return candidate
+def _session_attachment_name(session: dict, filename: str) -> str:
+    import secrets
+
+    token = session.get("_desktop_attachment_ref_token")
+    if not token:
+        token = secrets.token_hex(16)
+        session["_desktop_attachment_ref_token"] = token
+    path = Path(filename)
+    return f"{token}-{path.stem or 'attachment'}{path.suffix}"
+
+
+def _open_workspace_attachment_no_follow(observed: _ObservedAttachmentPath):
+    """Open the exact observed workspace file without following replacements."""
+    import stat as _stat
+
+    if os.name == "nt":
+        return _open_workspace_attachment_windows(observed)
+
+    relative = observed.path.relative_to(observed.workspace)
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("gateway file is not a safe workspace path")
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise ValueError(
+            "gateway path fallback requires safe no-follow access; upload data_url bytes instead"
+        )
+
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    )
+    directory_fds: list[int] = []
+    file_fd: int | None = None
+    try:
+        current_fd = os.open(observed.workspace, directory_flags)
+        directory_fds.append(current_fd)
+        _assert_attachment_identity(os.fstat(current_fd), observed.identities[0])
+        for component, identity in zip(
+            relative.parts[:-1], observed.identities[1:-1]
+        ):
+            current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            directory_fds.append(current_fd)
+            info = os.fstat(current_fd)
+            if not _stat.S_ISDIR(info.st_mode):
+                raise ValueError("gateway path parent is not a directory")
+            _assert_attachment_identity(info, identity)
+
+        file_fd = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=current_fd,
+        )
+        info = os.fstat(file_fd)
+        if not _stat.S_ISREG(info.st_mode):
+            raise ValueError("gateway file is not a regular file")
+        _assert_attachment_identity(info, observed.identities[-1])
+        opened = os.fdopen(file_fd, "rb")
+        file_fd = None
+        return opened
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "gateway file changed or is not a safe regular file in the session workspace"
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _write_unique_attachment(
+    workspace: Path,
+    root: Path,
+    root_fd: int | None,
+    filename: str,
+    *,
+    reserved_names: set[str],
+    payload: bytes | None = None,
+    source=None,
+) -> tuple[Path, int, int, str]:
+    """Create a uniquely named attachment and keep its descriptor open."""
+    if os.name == "nt":
+        return _write_unique_attachment_windows(
+            workspace,
+            root,
+            filename,
+            payload=payload,
+            source=source,
+            reserved_names=reserved_names,
+        )
+
+    assert root_fd is not None
+
     stem = Path(filename).stem or "attachment"
     suffix = Path(filename).suffix
-    counter = 2
+    counter = 1
     while True:
-        next_candidate = root / f"{stem}-{counter}{suffix}"
-        if not next_candidate.exists():
-            return next_candidate
-        counter += 1
+        candidate_name = filename if counter == 1 else f"{stem}-{counter}{suffix}"
+        if candidate_name in reserved_names:
+            counter += 1
+            continue
+        try:
+            fd = os.open(
+                candidate_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=root_fd,
+            )
+            break
+        except FileExistsError:
+            counter += 1
+
+    candidate = root / candidate_name
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as target:
+            size, sha256 = _write_attachment_stream(
+                target, payload=payload, source=source
+            )
+        return candidate, fd, size, sha256
+    except Exception:
+        os.close(fd)
+        try:
+            os.unlink(candidate_name, dir_fd=root_fd)
+        except OSError:
+            pass
+        raise
 
 
-def _resolve_gateway_attachment_path(raw: str) -> Path | None:
-    """Resolve a raw path token to a gateway-visible file, or None."""
+def _resolve_gateway_attachment_path(
+    raw: str, workspace: Path, workspace_alias: Path | None = None
+) -> _ObservedAttachmentPath | None:
+    """Observe an existing gateway path without dereferencing symlink children.
+
+    The returned device/inode chain is later matched against each opened
+    descriptor, so replacing either the file or one of its parents between
+    resolution and open fails closed.
+    """
     if not raw:
         return None
     try:
-        from cli import _detect_file_drop, _resolve_attachment_path, _split_path_input
+        from cli import _split_path_input
     except Exception:
         return None
 
-    dropped = _detect_file_drop(raw)
-    if dropped:
-        return Path(dropped["path"]).resolve()
+    from urllib.parse import unquote, urlparse
+
+    def lexical_candidate(token: str) -> _ObservedAttachmentPath | None:
+        token = str(token or "").strip()
+        if not token:
+            return None
+        if len(token) >= 2 and token[0] in {'"', "'"} and token[-1] == token[0]:
+            token = token[1:-1]
+        if not token:
+            return None
+
+        expanded = token
+        if token.startswith("file://"):
+            try:
+                parsed = urlparse(token)
+                expanded = unquote(parsed.path or "")
+                if parsed.netloc and os.name == "nt":
+                    expanded = f"//{parsed.netloc}{expanded}"
+                elif (
+                    os.name == "nt"
+                    and len(expanded) >= 3
+                    and expanded[0] == "/"
+                    and expanded[1].isalpha()
+                    and expanded[2] == ":"
+                ):
+                    expanded = expanded[1:]
+            except Exception:
+                expanded = token
+
+        expanded = os.path.expandvars(os.path.expanduser(expanded))
+        if os.name != "nt":
+            normalized = expanded.replace("\\", "/")
+            if (
+                len(normalized) >= 3
+                and normalized[0].isalpha()
+                and normalized[1:3] == ":/"
+            ):
+                expanded = f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
+
+        candidate = Path(expanded)
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        candidate = Path(os.path.abspath(candidate))
+        if workspace_alias is not None:
+            try:
+                candidate = workspace / candidate.relative_to(workspace_alias)
+            except ValueError:
+                pass
+        try:
+            return _observe_workspace_attachment_path(workspace, candidate)
+        except OSError:
+            return None
+
+    # Preserve the CLI's useful exact-path-first behavior for unquoted paths
+    # containing spaces, then fall back to its leading-token grammar when the
+    # input also carries trailing prompt text.
+    direct = lexical_candidate(raw)
+    if direct is not None:
+        return direct
     path_token, _remainder = _split_path_input(raw)
-    resolved = _resolve_attachment_path(path_token)
-    return Path(resolved).resolve() if resolved is not None else None
+    return lexical_candidate(path_token)
 
 
 def _decode_attachment_data_url(data_url: str) -> bytes:
@@ -13614,46 +14143,99 @@ def _decode_attachment_data_url(data_url: str) -> bytes:
         raise ValueError("invalid data_url payload") from exc
 
 
+@contextlib.contextmanager
 def _stage_session_file_attachment(
     session: dict,
     *,
     raw_path: str,
     data_url: str,
     name: str,
-) -> tuple[Path, bool]:
-    """Make a desktop file attachment available to the remote gateway agent.
+):
+    """Stage one file and bind its ref to the observed workspace inode chain.
 
-    Three cases:
-      1. The path resolves to a file already INSIDE the session workspace — use
-         it as-is (no copy, ``uploaded=False``).
-      2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into the session home's ``attachments/`` dir (bind-mounted into
-         container backends) so the ``@file:`` ref resolves inside the sandbox.
-      3. The path doesn't exist on the gateway (the common remote case: it's a
-         path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into the session home's ``attachments/`` dir.
-
-    Returns ``(stored_path, uploaded)``.
+    The yielded descriptor-backed identity remains registered for this session.
+    Prompt preprocessing reopens that exact chain and fails closed if the staged
+    file or any parent (including ``.hermes``) has been replaced.
     """
-    workspace = Path(_session_cwd(session)).resolve()
-    resolved = _resolve_gateway_attachment_path(raw_path)
-    if resolved is not None:
-        try:
-            resolved.relative_to(workspace)
-            return resolved, False
-        except ValueError:
-            payload = resolved.read_bytes()
-            filename = resolved.name
-    else:
-        if not data_url:
-            raise ValueError("file not found on gateway and no data_url provided")
+    workspace_alias = Path(os.path.abspath(_session_cwd(session)))
+    workspace = (
+        workspace_alias
+        if os.name == "nt"
+        else Path(_session_cwd(session)).resolve()
+    )
+    payload: bytes | None = None
+    source_context = contextlib.nullcontext(None)
+    uploaded = bool(data_url)
+    if data_url:
         payload = _decode_attachment_data_url(data_url)
-        filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
+        filename = _sanitize_attachment_name(
+            name or Path(str(raw_path or "")).name
+        )
+    else:
+        resolved = _resolve_gateway_attachment_path(
+            raw_path, workspace, workspace_alias
+        )
+        if resolved is None:
+            raise ValueError("file not found on gateway and no data_url provided")
+        from agent.file_safety import get_read_block_error
 
-    upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
-    return target.resolve(), True
+        if get_read_block_error(str(resolved.path)) is not None:
+            raise ValueError(
+                "path is a sensitive credential or internal Hermes path and cannot be attached"
+            )
+        filename = _sanitize_attachment_name(name or resolved.path.name)
+        source_context = _open_workspace_attachment_no_follow(resolved)
+
+    target_fd: int | None = None
+    observed: _ObservedAttachmentPath | None = None
+    registered: _RegisteredAttachment | None = None
+    ref_path = ""
+    registry = session.setdefault("_trusted_file_attachments", {})
+    try:
+        with source_context as source:
+            with _open_desktop_attachment_dir(session) as (
+                attachment_workspace,
+                upload_dir,
+                upload_dir_fd,
+                directory_identities,
+            ):
+                target, target_fd, size, sha256 = _write_unique_attachment(
+                    attachment_workspace,
+                    upload_dir,
+                    upload_dir_fd,
+                    _session_attachment_name(
+                        session, _sanitize_attachment_name(filename)
+                    ),
+                    reserved_names={Path(key).name for key in registry},
+                    payload=payload,
+                    source=source,
+                )
+                target_info = os.fstat(target_fd)
+                observed = _ObservedAttachmentPath(
+                    attachment_workspace,
+                    target,
+                    (*directory_identities, _attachment_stat_identity(target_info)),
+                )
+                registered = _RegisteredAttachment(observed, size, sha256)
+                ref_path = _attachment_ref_path(target)
+                registry[ref_path] = registered
+                yield _StagedAttachment(
+                    target, ref_path, uploaded, observed
+                )
+
+        # A wrapping staging context can replace `.hermes` or mutate the staged
+        # file while its descriptors close. Reopen and hash the registered bytes
+        # before the RPC response escapes; prompt.submit repeats the same checks.
+        assert registered is not None
+        with _trusted_session_attachment_opener(session, ref_path):
+            pass
+    except Exception:
+        if registered is not None and registry.get(ref_path) == registered:
+            registry.pop(ref_path, None)
+        raise
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
 
 
 # ── Methods: respond ─────────────────────────────────────────────────

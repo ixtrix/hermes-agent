@@ -37,6 +37,9 @@ export interface ComposerAttachment {
   purpose?: ManagedAttachmentPurpose
   supplierMetadata?: ManagedSupplierMetadata
   receipt?: ManagedAttachmentReceipt
+  /** Desktop-only original image path used for lazy preview after `path` is
+   * rewritten to a session-owned gateway path. Never serialized into prompts. */
+  sourcePath?: string
   attachedSessionId?: string
   /** Set while the file/image bytes are being staged into the session
    * workspace (remote upload or local stage), and 'error' if that failed.

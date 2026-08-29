@@ -15,7 +15,7 @@ import { useSessionLinkTitle } from '@/lib/session-link-title'
 import { parseSessionRefValue, sessionRefFallbackLabel } from '@/lib/session-refs'
 import { cn } from '@/lib/utils'
 
-import { referenceKind, referenceRe, referenceStyle, WIRE_REFERENCE_KINDS } from './reference-kinds'
+import { parseReference, referenceKind, referenceRe, referenceStyle, WIRE_REFERENCE_KINDS } from './reference-kinds'
 
 const HERMES_REF_TYPES = WIRE_REFERENCE_KINDS
 type HermesRefType = (typeof HERMES_REF_TYPES)[number]
@@ -158,11 +158,7 @@ function needsQuoting(value: string): boolean {
   return /[\s()[\]{}<>"'`]/.test(value)
 }
 
-export function formatRefValue(value: string): string {
-  if (!needsQuoting(value)) {
-    return value
-  }
-
+function quoteRefValue(value: string): string {
   if (!value.includes('`')) {
     return `\`${value}\``
   }
@@ -176,6 +172,10 @@ export function formatRefValue(value: string): string {
   }
 
   return value
+}
+
+export function formatRefValue(value: string): string {
+  return needsQuoting(value) ? quoteRefValue(value) : value
 }
 
 export const hermesDirectiveFormatter: Unstable_DirectiveFormatter = {
@@ -210,7 +210,14 @@ export const hermesDirectiveFormatter: Unstable_DirectiveFormatter = {
       const kindMatch = rawText.match(/^@([^:]+):/)
       const kind = kindMatch?.[1] ?? item.type
 
-      return `@${kind}:${formatRefValue(insertId)}`
+      const formattedValue =
+        kind === 'file' && /:\d+(?:-\d+)?$/.test(insertId) ? quoteRefValue(insertId) : formatRefValue(insertId)
+      return `@${kind}:${formattedValue}`
+    }
+    // Parsed quoted file ranges keep their canonical wire value in `id` so
+    // the range remains outside the closing quote across editor hydration.
+    if (item.id.startsWith(`@${item.type}:`) && parseReference(item.id)) {
+      return item.id
     }
 
     // Fallback for legacy callers that pass raw `id` strings.
@@ -235,13 +242,27 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
       id: match[3] || match[2] || ''
     })),
     ...Array.from(text.matchAll(HERMES_DIRECTIVE_RE)).map(match => {
-      const id = unwrapRefValue(match[2] || '')
-
+      const parsed = parseReference(match[0])
+      const type = parsed?.kind || match[1] || 'file'
+      const wireValue = match[2] || ''
+      const baseId = parsed?.value || unwrapRefValue(wireValue)
+      const targetId = parsed?.lineRange ? `${baseId}:${parsed.lineRange}` : baseId
+      const normalizedReference = `@${type}:${formatRefValue(baseId)}${parsed?.lineRange ? `:${parsed.lineRange}` : ''}`
+      const normalizedParsed = parsed?.quoted ? parseReference(normalizedReference) : null
+      const quotedSyntaxIsSemantic =
+        parsed?.quoted &&
+        (baseId !== baseId.trim() ||
+          Boolean(parsed.lineRange) ||
+          normalizedParsed?.value !== baseId ||
+          normalizedParsed?.lineRange !== parsed.lineRange)
+      const id = quotedSyntaxIsSemantic
+        ? `@${type}:${wireValue}${parsed.lineRange ? `:${parsed.lineRange}` : ''}`
+        : targetId
       return {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,
-        type: match[1] || 'file',
-        label: refChipLabel(match[1] || 'file', id),
+        type,
+        label: refChipLabel(type, targetId),
         id
       }
     }),
@@ -543,13 +564,23 @@ const SlashChip: FC<{ kind: SlashChipKind; label: string; value: string }> = ({ 
  *  entry (a url, …) renders as a real button that runs it on click; everything
  *  else is inert text. `onClick` overrides for chips that resolve their target
  *  themselves (session, which needs the async navigator). */
+function directiveTargetId(type: string, id: string): string {
+  if (!id.startsWith(`@${type}:`)) {
+    return id
+  }
+
+  const parsed = parseReference(id)
+  return parsed?.lineRange ? `${parsed.value}:${parsed.lineRange}` : parsed?.value || id
+}
+
 const DirectiveChip: FC<{
   type: string
   label: string
   id: string
   onClick?: () => void
 }> = ({ type, label, id, onClick }) => {
-  const activate = onClick ?? (DIRECTIVE_ACTIONS[type] ? () => DIRECTIVE_ACTIONS[type]!.run(id) : undefined)
+  const targetId = directiveTargetId(type, id)
+  const activate = onClick ?? (DIRECTIVE_ACTIONS[type] ? () => DIRECTIVE_ACTIONS[type]!.run(targetId) : undefined)
 
   const body = (
     <>
@@ -560,9 +591,9 @@ const DirectiveChip: FC<{
 
   const props = {
     ...refAttrs(type, cn('wrap-anywhere', activate && 'cursor-pointer')),
-    'data-directive-id': id,
+    'data-directive-id': targetId,
     'data-slot': 'aui_directive-chip',
-    title: id
+    title: targetId
   }
 
   return activate ? (

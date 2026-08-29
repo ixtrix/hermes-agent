@@ -443,12 +443,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const uploadOsDropRefs = useCallback(
     async (osDrops: ReturnType<typeof extractDroppedFiles>): Promise<InlineRefInput[]> => {
       if (!gateway || !sessionId) {
-        // No session to stage into — best-effort inline refs (matches old path).
-        return droppedFileInlineRefs(osDrops, cwd)
+        notifyError(new Error('No active gateway session is available to stage dropped files'), t.desktop.dropFiles)
+        return []
       }
 
       const remote = isSessionRemote(sessionId)
-
       const requestGateway = <T,>(method: string, params?: Record<string, unknown>) =>
         gateway.request<T>(method, params)
 
@@ -467,7 +466,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         try {
           const uploaded = await uploadComposerAttachment(
             { detail: path, id: attachmentId(kind, path), kind, label: pathLabel(path), path },
-            { backendCwd: cwd, remote, requestGateway, sessionId, terminalBackend: $terminalBackend.get() }
+            { requestGateway, sessionId }
           )
 
           const ref = attachmentDisplayText(uploaded)
@@ -482,7 +481,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       return refs
     },
-    [cwd, gateway, sessionId, t.desktop.dropFiles]
+    [gateway, sessionId, t.desktop.dropFiles]
   )
 
   const resetDragState = useCallback(() => {

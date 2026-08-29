@@ -42,7 +42,11 @@ import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { GatewayRequester } from '../contrib/types'
-import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
+import {
+  assertAttachmentCanSubmitWithoutPath,
+  assertManagedAttachmentStateCoherent,
+  uploadComposerAttachment
+} from '../session/hooks/use-prompt-actions'
 import {
   appendMidTurnUserMessage,
   applyBranchVisibility,
@@ -227,9 +231,16 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       }
 
       for (const attachment of attachments) {
-        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
-          synced.push(attachment)
+        assertAttachmentCanSubmitWithoutPath(attachment)
+        assertManagedAttachmentStateCoherent(attachment)
 
+        if (!attachment.path) {
+          synced.push(attachment)
+          continue
+        }
+
+        if (attachment.attachedSessionId === liveSessionId) {
+          synced.push(attachment)
           continue
         }
 
@@ -250,8 +261,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
               // and remove + same-path reattach must not receive stale staging.
               scope.attachments.updateIfCurrent(attachment, {
                 attachedSessionId: next.attachedSessionId,
+                detail: next.detail,
                 label: next.label,
                 path: next.path,
+                sourcePath: next.sourcePath,
                 refText: next.refText,
                 uploadState: next.uploadState
               })

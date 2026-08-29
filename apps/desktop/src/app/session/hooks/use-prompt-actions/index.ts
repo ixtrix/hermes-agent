@@ -3,6 +3,8 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { formatRefValue } from '@/components/assistant-ui/directive-text'
+import { parseReference } from '@/components/assistant-ui/reference-kinds'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
@@ -31,7 +33,6 @@ import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
   $connection,
-  $currentCwd,
   $messages,
   $terminalBackend,
   getSessionOwnerHint,
@@ -94,53 +95,95 @@ interface HandoffResult {
   error?: string
 }
 
-const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
-const POSIX_ABSOLUTE_PATH_RE = /^\/(?!\/)/
+const ABSOLUTE_DESKTOP_PATH_RE = /^(?:file:\/\/|[A-Za-z]:[\\/]|[\\/])/i
 
-// Terminal backends whose execution environment has its own filesystem
-// (docker/ssh/singularity/modal/...) cannot see the desktop's host paths —
-// they must be crossed as bytes, like remote attachments. Mirrors the
-// container_backend set in tools/terminal_tool.py::_get_env_config.
-const CONTAINER_TERMINAL_BACKENDS = new Set(['docker', 'ssh', 'singularity', 'modal', 'daytona', 'vercel_sandbox'])
+// Absolute/rooted paths and file: URIs name files on the desktop host, not a
+// gateway-owned workspace. Always send their bytes; only workspace-relative
+// refs pass through.
+function isAbsoluteDesktopPath(path: string): boolean {
+  return ABSOLUTE_DESKTOP_PATH_RE.test(path.trim())
+}
 
-// `mode: local` means the gateway was launched locally, not necessarily that
-// Electron and the gateway share a filesystem. Windows Desktop can front a
-// WSL/Docker backend whose cwd is POSIX, so a Windows host path must cross the
-// boundary as bytes just like a remote attachment. Container terminal backends
-// (docker, ssh, ...) always need bytes: the sandbox has its own filesystem and
-// the host path would dangle inside it (#76577).
-function attachmentPathNeedsUpload(path: string, backendCwd?: null | string, terminalBackend?: string): boolean {
-  if (CONTAINER_TERMINAL_BACKENDS.has((terminalBackend || '').trim().toLowerCase())) {
-    return true
+function isSessionOwnedFileRef(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/').replace(/^(?:\.\/)+/, '')
+  return normalized === '.hermes/desktop-attachments' || normalized.startsWith('.hermes/desktop-attachments/')
+}
+
+export function assertAttachmentCanSubmitWithoutPath(attachment: ComposerAttachment): void {
+  if (!['file', 'folder', 'image'].includes(attachment.kind) || (attachment.path && attachment.kind !== 'folder')) {
+    return
   }
 
-  return WINDOWS_ABSOLUTE_PATH_RE.test(path.trim()) && POSIX_ABSOLUTE_PATH_RE.test(backendCwd?.trim() || '')
+  const refText = attachment.refText || ''
+  const refPath = parseReference(refText)?.value || ''
+  const rawRefPath = refText
+    .trim()
+    .replace(/^@(file|folder|image):[^\S\n]*/, '')
+    .replace(/^[\s"'`(\[{<]+/, '')
+
+  if (
+    (refPath && isAbsoluteDesktopPath(refPath)) ||
+    isAbsoluteDesktopPath(rawRefPath) ||
+    (attachment.kind === 'folder' && attachment.path && isAbsoluteDesktopPath(attachment.path))
+  ) {
+    const reason =
+      attachment.kind === 'folder'
+        ? 'local folder paths are unavailable to this session'
+        : 'local file bytes are unavailable'
+    throw new Error(`Could not attach ${attachment.label || 'file'}: ${reason}`)
+  }
+}
+
+export function assertManagedAttachmentStateCoherent(attachment: ComposerAttachment): void {
+  if (!attachment.attachedSessionId || (attachment.kind !== 'file' && attachment.kind !== 'image')) {
+    return
+  }
+
+  const path = attachment.path || ''
+  const refText = attachment.refText || ''
+  const ref = parseReference(refText)
+  const rawRefPath = refText
+    .trim()
+    .replace(/^@(file|image):[^\S\n]*/, '')
+    .replace(/^[\s"'`(\[{<]+/, '')
+
+  if (
+    !path ||
+    attachment.detail !== path ||
+    !ref ||
+    ref.kind !== attachment.kind ||
+    ref.value !== path ||
+    isAbsoluteDesktopPath(path) ||
+    isAbsoluteDesktopPath(ref.value) ||
+    isAbsoluteDesktopPath(rawRefPath)
+  ) {
+    throw new Error(`Could not attach ${attachment.label || pathLabel(path)}: attachment state is inconsistent`)
+  }
 }
 
 /**
  * Stage one file/image attachment into the session workspace and return the
- * attachment rewritten with the gateway-side ref. Attachments upload their
- * bytes for remote gateways and local cross-filesystem backends; otherwise the
- * gateway receives the shared local path. Throws on failure so callers can
- * surface an error. Shared by submit-time sync, the eager drop-time upload, and
- * the message-edit composer drop — keep them in lockstep.
+ * attachment rewritten with the gateway-side ref. Absolute desktop paths send
+ * bytes; workspace-relative paths pass through for the gateway to resolve.
+ * Throws on failure so callers can surface an error. Shared by submit-time
+ * sync, eager drop-time upload, and message-edit composer drop.
  */
 export async function uploadComposerAttachment(
   attachment: ComposerAttachment,
   opts: {
-    backendCwd?: null | string
-    remote: boolean
     requestGateway: GatewayRequest
     sessionId: string
     /** Durable id used to re-register after sleep/wake or a backend restart. */
     storedSessionId?: null | string
     /** Called when the attach recovered onto a fresh live id. */
     onSessionRecovered?: (sessionId: string) => void
-    terminalBackend?: string
   }
 ): Promise<ComposerAttachment> {
   const { backendCwd, remote, requestGateway, sessionId, storedSessionId, onSessionRecovered, terminalBackend } = opts
-  const path = attachment.path ?? ''
+  const path =
+    attachment.kind === 'image' || attachment.kind === 'file'
+      ? attachment.sourcePath || attachment.path || ''
+      : attachment.path || ''
   const label = attachment.label || pathLabel(path)
 
   const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
@@ -268,6 +311,10 @@ export async function uploadComposerAttachment(
     }
   }
 
+  if (attachment.kind === 'file' && !attachment.sourcePath && isSessionOwnedFileRef(path)) {
+    throw new Error(`Could not attach ${label}: session-owned file ref has no authoritative source`)
+  }
+
   const stageForSession = async (liveSessionId: string): Promise<ComposerAttachment> => {
     if (attachment.kind === 'image') {
       const result = imagePayload
@@ -284,33 +331,53 @@ export async function uploadComposerAttachment(
       if (!result.attached) {
         throw new Error(result.message || `Could not attach ${label}`)
       }
-
-      const attachedPath = result.path || path
+      // A byte upload crossed the desktop/gateway trust boundary. Its absolute
+      // storage path stays private to the gateway; chips and prompts retain
+      // only the session-owned opaque ref returned for those queued bytes.
+      const attachedPath = uploadBytes ? result.ref_path || '' : path
+      if (!attachedPath || (uploadBytes && isAbsoluteDesktopPath(attachedPath))) {
+        throw new Error(`Could not attach ${label}: gateway returned no session-owned image ref`)
+      }
 
       return {
         ...attachment,
         attachedSessionId: liveSessionId,
-        label: attachedPath ? pathLabel(attachedPath) : attachment.label,
+        detail: attachedPath,
+        label: pathLabel(attachedPath),
         path: attachedPath,
+        sourcePath: uploadBytes ? attachment.sourcePath || path : attachment.sourcePath,
+        refText: `@image:${formatRefValue(attachedPath)}`,
         uploadState: undefined
       }
     }
 
     const result = await requestGateway<FileAttachResponse>('file.attach', {
       name: label,
-      path,
       session_id: liveSessionId,
-      ...(fileDataUrl ? { data_url: fileDataUrl } : {})
+      ...(fileDataUrl ? { data_url: fileDataUrl } : { path })
     })
 
-    if (!result.attached || !result.ref_text) {
-      throw new Error(result.message || `Could not attach ${label}`)
+    const attachedRef = parseReference(result.ref_text || '')
+    const attachedPath = result.ref_path || attachedRef?.value || ''
+
+    if (
+      !result.attached ||
+      !result.ref_text ||
+      attachedRef?.kind !== 'file' ||
+      !attachedPath ||
+      isAbsoluteDesktopPath(attachedPath)
+    ) {
+      throw new Error(result.message || `Could not attach ${label}: gateway returned no session-owned file path`)
     }
 
     return {
       ...attachment,
       attachedSessionId: liveSessionId,
+      detail: attachedPath,
+      label,
+      path: attachedPath,
       refText: result.ref_text,
+      sourcePath: fileDataUrl ? attachment.sourcePath || path : attachment.sourcePath,
       uploadState: undefined
     }
   }
@@ -477,6 +544,16 @@ export function usePromptActions({
           await inFlight
           attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
         }
+        // Pathless context refs are valid only when their namespace is visible
+        // to the gateway. Folders have no byte-upload seam, so validate every
+        // folder in every connection mode before it can reach prompt.submit.
+        assertAttachmentCanSubmitWithoutPath(attachment)
+        assertManagedAttachmentStateCoherent(attachment)
+
+        if (!attachment.path) {
+          synced.push(attachment)
+          continue
+        }
 
         const managedAttachable =
           isManagedProductBuild &&
@@ -491,19 +568,15 @@ export function usePromptActions({
         // pass through without another upload.
         if ((!attachment.path && !managedAttachable) || alreadyAttached) {
           synced.push(attachment)
-
           continue
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
           const nextAttachment = await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
             requestGateway,
             sessionId: liveSessionId,
             storedSessionId,
-            onSessionRecovered,
-            terminalBackend: $terminalBackend.get()
+            onSessionRecovered
           })
 
           // Update-only: never resurrect a chip the user removed mid-upload.
@@ -514,8 +587,10 @@ export function usePromptActions({
               patchMainComposerAttachmentOccurrence(original, {
                 attachedSessionId: nextAttachment.attachedSessionId,
                 receipt: nextAttachment.receipt,
+                detail: nextAttachment.detail,
                 label: nextAttachment.label,
                 path: nextAttachment.path,
+                sourcePath: nextAttachment.sourcePath,
                 refText: nextAttachment.refText,
                 uploadState: nextAttachment.uploadState
               })
@@ -550,7 +625,6 @@ export function usePromptActions({
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
       const remote = isSessionRemote(sessionId)
-
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
       try {
@@ -558,11 +632,8 @@ export function usePromptActions({
         // don't resurrect it — just drop the staged result on the floor.
         updateComposerAttachment(
           await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
             requestGateway,
-            sessionId,
-            terminalBackend: $terminalBackend.get()
+            sessionId
           })
         )
       } catch (err) {
