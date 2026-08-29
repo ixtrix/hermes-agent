@@ -63,6 +63,11 @@ const PRIVY_ACCESS_COOKIE_VARIANTS = ['__Host-privy-token', '__Secure-privy-toke
 // is the built-in root alias; these names cannot be created as profiles.
 const RESERVED_REMOTE_PROFILES = new Set(['hermes', 'test', 'tmp', 'root', 'sudo'])
 
+const SCOPE_INTERNAL_GATEWAY_HOST_SUFFIX = '.internal.hermes.scopefurnishing.co.uk'
+
+const SCOPE_INTERNAL_GATEWAY_ORIGIN =
+  'https://ben.internal.hermes.scopefurnishing.co.uk/instances/a27e539fc517169d8da049ea6e2c8519'
+
 function normalizeRemoteBaseUrl(rawUrl) {
   let value = String(rawUrl || '').trim()
 
@@ -97,6 +102,30 @@ function normalizeRemoteBaseUrl(rawUrl) {
   parsed.pathname = parsed.pathname.replace(/\/+$/, '')
 
   return parsed.toString().replace(/\/+$/, '')
+}
+
+function isEnrolledInternalWorkstationConnection(candidate) {
+  if (
+    !candidate ||
+    typeof candidate !== 'object' ||
+    candidate.mode !== 'remote' ||
+    candidate.authMode !== 'oauth' ||
+    typeof candidate.baseUrl !== 'string'
+  ) {
+    return false
+  }
+
+  try {
+    const baseUrl = normalizeRemoteBaseUrl(candidate.baseUrl)
+    const parsed = new URL(baseUrl)
+
+    return (
+      parsed.hostname.endsWith(SCOPE_INTERNAL_GATEWAY_HOST_SUFFIX) &&
+      baseUrl === SCOPE_INTERNAL_GATEWAY_ORIGIN
+    )
+  } catch {
+    return false
+  }
 }
 
 function buildGatewayWsUrl(baseUrl, token) {
@@ -995,6 +1024,7 @@ export {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  isEnrolledInternalWorkstationConnection,
   isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,

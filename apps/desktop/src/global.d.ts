@@ -13,8 +13,67 @@ import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } f
 export {}
 
 declare global {
+  interface HermesWorkstationSourceReceipt {
+    dev: number
+    ino: number
+    mtimeMs: number
+    path: string
+    sha256: string
+    size: number
+  }
+
+  interface HermesWorkstationEntry {
+    isDirectory: boolean
+    mtimeMs: number
+    name: string
+    path: string
+    size: number
+  }
+
+  interface HermesWorkstationFolders {
+    (
+      op: 'roots',
+      payload: Record<string, never>
+    ): Promise<{
+      ok: true
+      roots: { desktop: string; documents: string; downloads: string }
+    }>
+    (
+      op: 'list',
+      payload: { path: string }
+    ): Promise<{ entries: HermesWorkstationEntry[]; ok: true }>
+    (
+      op: 'stage',
+      payload: { path: string }
+    ): Promise<{ contentBase64: string; ok: true; source: HermesWorkstationSourceReceipt }>
+    (
+      op: 'save',
+      payload: { contentBase64: string; source: HermesWorkstationSourceReceipt }
+    ): Promise<
+      | { error: 'source-conflict'; ok: false }
+      | { ok: true; source: HermesWorkstationSourceReceipt }
+    >
+    (
+      op: 'create',
+      payload: { contentBase64: string; path: string }
+    ): Promise<{ ok: true; source: HermesWorkstationSourceReceipt }>
+    (
+      op: 'move',
+      payload: {
+        destinationPath: string
+        sourcePath: string
+        sourceReceipt: HermesWorkstationSourceReceipt
+      }
+    ): Promise<
+      | { error: 'source-conflict'; ok: false }
+      | { ok: true; source: HermesWorkstationSourceReceipt }
+    >
+    (op: 'trash', payload: { path: string }): Promise<{ ok: true; path: string }>
+  }
+
   interface Window {
     hermesDesktop: {
+      workstationFolders: HermesWorkstationFolders
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.

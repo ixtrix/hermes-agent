@@ -91,6 +91,7 @@ import {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  isEnrolledInternalWorkstationConnection,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
@@ -14952,6 +14953,19 @@ ipcMain.on('hermes:logs:renderer-error', (_event, report) => {
 
 // Local filesystem + plugin-root IPC (readDir/reveal/rename/trash/…) — see fs-ipc.ts.
 registerFsIpc({
+  authorizeWorkstationFolders: async () => {
+    const activeConnection = backendConnectionState.getPromise()
+
+    if (!activeConnection) {
+      return false
+    }
+
+    try {
+      return isEnrolledInternalWorkstationConnection(await activeConnection)
+    } catch {
+      return false
+    }
+  },
   hermesHome: HERMES_HOME,
   readActiveDesktopProfile,
   expandUserPath,
