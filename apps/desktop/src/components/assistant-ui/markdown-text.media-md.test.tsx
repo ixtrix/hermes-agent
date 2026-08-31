@@ -34,12 +34,13 @@ describe('markdown documents delivered via MEDIA', () => {
     expect(screen.getByText('report.md')).toBeTruthy()
   })
 
-  it('still renders a non-markdown MEDIA file through the media fallback', async () => {
-    const href = mediaMarkdownHref('/home/user/out/archive.zip')
+  it('renders every generic MEDIA file through the preview rail', async () => {
+    const href = mediaMarkdownHref('/home/user/out/order.pdf')
 
-    render(<MarkdownTextContent isRunning={false} text={`[archive.zip](${href})`} />)
+    render(<MarkdownTextContent isRunning={false} text={`[order.pdf](${href})`} />)
 
-    expect(await screen.findByText(/archive\.zip/)).toBeTruthy()
-    expect(screen.queryByRole('button')).toBeNull()
+    expect(await screen.findByRole('button')).toBeTruthy()
+    expect(screen.queryByText(/^Loading /)).toBeNull()
+    expect(screen.getByText('order.pdf')).toBeTruthy()
   })
 })
