@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -4482,6 +4483,7 @@ def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
         "session_key": "session-key",
+        "_desktop_attachment_ref_token": "test",
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -10384,11 +10386,7 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
 
 
 def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp_path):
-    """Remote case: client path doesn't exist on gateway → decode data_url bytes.
-
-    Staged into the session home's ``attachments/`` dir (bind-mounted into
-    container backends) rather than the workspace (#76577).
-    """
+    """Remote case: uploaded bytes become a workspace-owned parser-safe ref."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "home"
@@ -10407,25 +10405,832 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
                 "method": "file.attach",
                 "params": {
                     "session_id": "sid",
-                    "path": "/Users/alice/Downloads/report.txt",
                     "name": "report.txt",
                     "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
                 },
             }
         )
 
-        stored = home / "attachments" / "report.txt"
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["path"] == str(stored)
-        assert resp["result"]["ref_text"] == f"@file:{stored}"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.txt"
+        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report.txt"
+        assert not (home / "attachments").exists()
         assert stored.read_text(encoding="utf-8") == "hello world"
     finally:
         server._sessions.pop("sid", None)
 
 
-def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
-    """Local case: gateway can see the file but it's outside the workspace → copy in."""
+def test_file_attach_with_real_session_create_and_cli_resolution(monkeypatch, tmp_path):
+    """Exercise production session creation and path resolution."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("real session bytes", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "_schedule_session_cap_enforcement", lambda *_args, **_kwargs: None
+    )
+
+    created = server.handle_request(
+        {
+            "id": "create",
+            "method": "session.create",
+            "params": {"cwd": str(workspace)},
+        }
+    )
+    sid = created["result"]["session_id"]
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "attach",
+                "method": "file.attach",
+                "params": {"session_id": sid, "path": str(source)},
+            }
+        )
+
+        ref_path = resp["result"]["path"]
+        stored = workspace / ref_path
+        assert created["result"]["info"]["cwd"] == str(workspace)
+        assert ref_path.startswith(".hermes/desktop-attachments/")
+        assert ref_path.endswith("-report.txt")
+        assert resp["result"]["ref_text"] == f"@file:{ref_path}"
+        assert resp["result"]["uploaded"] is False
+        assert stored.read_text(encoding="utf-8") == "real session bytes"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.require_symlinks
+@pytest.mark.macos_only
+def test_file_attach_symlinked_session_cwd_keeps_relative_ref(monkeypatch, tmp_path):
+    """Keep a canonical staging path relative when the cwd is an alias."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+    server._sessions["sid"] = _session(cwd=str(alias))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,YWxpYXMgYnl0ZXM=",
+                },
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.txt"
+        assert resp["result"]["ref_text"] == (
+            "@file:.hermes/desktop-attachments/test-report.txt"
+        )
+        assert str(workspace) not in resp["result"]["ref_text"]
+        assert str(alias) not in resp["result"]["ref_text"]
+        assert stored.read_text(encoding="utf-8") == "alias bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.windows_only
+def test_file_attach_fails_closed_on_windows_gateway_without_safe_creation(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.csv",
+                    "data_url": "data:text/csv;base64,c2t1LHF0eQpBLDIK",
+                },
+            }
+        )
+
+        assert "error" in resp
+        assert "secure workspace attachment staging is unavailable" in resp["error"]["message"]
+        assert not (workspace / ".hermes").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_resolves_relative_path_from_session_workspace(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    source = workspace / "data" / "report.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("sku,qty\nA,2\n", encoding="utf-8")
+    stale_cwd = tmp_path / "stale"
+    stale_cwd.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(stale_cwd))
+    monkeypatch.chdir(stale_cwd)
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "data/report.csv",
+                },
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-report.csv"
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-report.csv"
+        assert stored.read_text(encoding="utf-8") == "sku,qty\nA,2\n"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_preserves_spaces_inside_quoted_relative_path(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / " report.txt ").write_text("edge-spaced bytes", encoding="utf-8")
+    (workspace / "report.txt").write_text("trimmed bytes", encoding="utf-8")
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": '" report.txt "',
+                },
+            }
+        )
+
+        staged = workspace / resp["result"]["path"]
+        assert staged.read_text(encoding="utf-8") == "edge-spaced bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.windows_only
+def test_file_attach_resolves_unquoted_relative_windows_path_with_spaces(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    source = workspace / "data" / "quarterly report.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text("sku,qty\nA,2\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "stale"))
+
+    observed = server._resolve_gateway_attachment_path(
+        str(Path("data") / "quarterly report.csv"),
+        workspace,
+        workspace,
+    )
+
+    assert observed is not None
+    assert observed.path == source
+
+
+
+@pytest.mark.linux_only
+def test_file_attach_rejects_symlinked_workspace_staging_directory(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / ".hermes").symlink_to(outside, target_is_directory=True)
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2FmZQ==",
+                },
+            }
+        )
+
+        assert "error" in resp
+        assert "not a safe directory" in resp["error"]["message"]
+        assert list(outside.iterdir()) == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_uploaded_pdf_becomes_model_context(monkeypatch, tmp_path):
+    """The returned workspace ref must survive prompt preprocessing."""
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "harmless.pdf",
+                    "data_url": (
+                        "data:application/pdf;base64,"
+                        "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyA+"
+                        "PgplbmRvYmoKJSVFT0YK"
+                    ),
+                },
+            }
+        )
+        ref_text = resp["result"]["ref_text"]
+        context = preprocess_context_references(
+            f"Review {ref_text}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                server._sessions["sid"], target
+            ),
+        )
+
+        assert ref_text == "@file:.hermes/desktop-attachments/test-harmless.pdf"
+        assert resp["result"]["path"] == (
+            ".hermes/desktop-attachments/test-harmless.pdf"
+        )
+        assert str(workspace) not in resp["result"]["path"]
+        assert context.warnings == []
+        assert context.expanded is True
+        assert "--- Attached Context ---" in context.message
+        assert "application/pdf" in context.message
+        assert "exact session-owned bytes captured immutably" in context.message
+        assert "JVBERi0xLjQK" in context.message
+        assert "available on disk" not in context.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_prompt_rejects_in_workspace_store_replacement(
+    monkeypatch, tmp_path
+):
+    """A redirected relative ref must not consume preexisting workspace bytes."""
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2FmZSBzdGFnZWQgYnl0ZXM=",
+                },
+            }
+        )
+        ref_text = resp["result"]["ref_text"]
+        staged_store = workspace / ".hermes-staged"
+        (workspace / ".hermes").rename(staged_store)
+        redirected_store = workspace / "redirect" / "desktop-attachments"
+        redirected_store.mkdir(parents=True)
+        (redirected_store / "report.txt").write_text(
+            "preexisting attacker bytes", encoding="utf-8"
+        )
+        (workspace / ".hermes").symlink_to(
+            workspace / "redirect", target_is_directory=True
+        )
+
+        context = preprocess_context_references(
+            f"Review {ref_text}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+
+        assert ref_text == "@file:.hermes/desktop-attachments/test-report.txt"
+        assert "preexisting attacker bytes" not in context.message
+        assert "safe staged bytes" not in context.message
+        assert context.warnings
+        assert "changed or is not a safe regular file" in context.warnings[0]
+        assert (
+            staged_store / "desktop-attachments" / "test-report.txt"
+        ).read_text(encoding="utf-8") == "safe staged bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_registered_ref_preprocesses_exact_staged_bytes(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,ZXhhY3Qgc3RhZ2VkIGJ5dGVz",
+                },
+            }
+        )
+        context = preprocess_context_references(
+            f"Review {resp['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+
+        assert context.warnings == []
+        assert "exact staged bytes" in context.message
+        assert (
+            workspace / ".hermes" / "desktop-attachments" / "test-report.txt"
+        ).read_bytes() == b"exact staged bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_never_rebinds_deleted_registered_ref(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,Zmlyc3QgYnl0ZXM=",
+                },
+            }
+        )
+        (workspace / first["result"]["path"]).unlink()
+        second = server.handle_request(
+            {
+                "id": "2",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2Vjb25kIGJ5dGVz",
+                },
+            }
+        )
+
+        assert first["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report.txt"
+        assert second["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-report-2.txt"
+
+        old_context = preprocess_context_references(
+            f"Review {first['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+        new_context = preprocess_context_references(
+            f"Review {second['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+
+        assert old_context.warnings
+        assert "second bytes" not in old_context.message
+        assert new_context.warnings == []
+        assert "second bytes" in new_context.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_never_reuses_deleted_ref_across_sessions(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_a = _session(
+        cwd=str(workspace), _desktop_attachment_ref_token="session-a"
+    )
+    server._sessions["sid-a"] = session_a
+
+    try:
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid-a",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c3RhbGUgYSBieXRlcw==",
+                },
+            }
+        )
+        (workspace / first["result"]["path"]).unlink()
+        server._sessions.pop("sid-a", None)
+
+        session_b = _session(
+            cwd=str(workspace), _desktop_attachment_ref_token="session-b"
+        )
+        server._sessions["sid-b"] = session_b
+        second = server.handle_request(
+            {
+                "id": "2",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid-b",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,bmV3IGIgYnl0ZXM=",
+                },
+            }
+        )
+
+        assert first["result"]["ref_text"] != second["result"]["ref_text"]
+        assert first["result"]["ref_text"].endswith(
+            "/session-a-report.txt"
+        )
+        assert second["result"]["ref_text"].endswith(
+            "/session-b-report.txt"
+        )
+
+        old_context = preprocess_context_references(
+            f"Review {first['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session_b, target
+            ),
+        )
+        new_context = preprocess_context_references(
+            f"Review {second['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session_b, target
+            ),
+        )
+
+        assert old_context.warnings
+        assert "new b bytes" not in old_context.message
+        assert new_context.warnings == []
+        assert "new b bytes" in new_context.message
+    finally:
+        server._sessions.pop("sid-a", None)
+        server._sessions.pop("sid-b", None)
+
+
+def test_file_attach_registered_ref_rejects_in_place_byte_mutation(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,ZXhhY3Qgc3RhZ2VkIGJ5dGVz",
+                },
+            }
+        )
+        staged = workspace / resp["result"]["path"]
+        original_size = staged.stat().st_size
+        staged.write_bytes(b"x" * original_size)
+
+        context = preprocess_context_references(
+            f"Review {resp['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                session, target
+            ),
+        )
+
+        assert "exact staged bytes" not in context.message
+        assert "x" * original_size not in context.message
+        assert context.warnings
+        assert "attachment bytes changed after staging" in context.warnings[0]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    "ref_target",
+    [
+        ".hermes/desktop-attachments/forged.txt",
+        ".hermes/desktop-attachments/../forged.txt",
+    ],
+)
+def test_file_attach_forged_unregistered_reserved_ref_fails_closed(
+    tmp_path, ref_target
+):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    forged = (workspace / ref_target).resolve()
+    forged.parent.mkdir(parents=True)
+    forged.write_text("forged preexisting bytes", encoding="utf-8")
+    session = _session(cwd=str(workspace))
+
+    context = preprocess_context_references(
+        f"Review @file:{ref_target}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+        trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+            session, target
+        ),
+    )
+
+    assert "forged preexisting bytes" not in context.message
+    assert context.warnings == [
+        f"@file:{ref_target}: "
+        "session-owned attachment reference is not registered for this session"
+    ]
+
+
+def test_file_attach_absolute_unregistered_reserved_ref_fails_closed(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    forged = workspace / ".hermes" / "desktop-attachments" / "forged.txt"
+    forged.parent.mkdir(parents=True)
+    forged.write_text("absolute forged bytes", encoding="utf-8")
+    session = _session(cwd=str(workspace))
+
+    context = preprocess_context_references(
+        f"Review @file:{forged}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+        trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+            session, target
+        ),
+    )
+
+    assert "absolute forged bytes" not in context.message
+    assert context.warnings
+    assert "not registered for this session" in context.warnings[0]
+
+
+@pytest.mark.macos_only
+def test_file_attach_symlink_alias_to_unregistered_reserved_ref_fails_closed(
+    tmp_path,
+):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    forged = reserved / "forged.txt"
+    forged.write_text("aliased forged bytes", encoding="utf-8")
+    (workspace / "attachment-alias").symlink_to(reserved, target_is_directory=True)
+    session = _session(cwd=str(workspace))
+
+    context = preprocess_context_references(
+        "Review @file:attachment-alias/forged.txt",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+        trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+            session, target
+        ),
+    )
+
+    assert "aliased forged bytes" not in context.message
+    assert context.warnings
+    assert "not registered for this session" in context.warnings[0]
+
+
+def test_folder_reference_cannot_list_reserved_attachment_namespace(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    (reserved / "secret.pdf").write_bytes(b"secret")
+
+    for target in (".hermes/desktop-attachments", str(reserved)):
+        context = preprocess_context_references(
+            f"Review @folder:{target}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+        )
+
+        assert "secret.pdf" not in context.message
+        assert context.warnings
+        assert "attachment namespace cannot be listed" in context.warnings[0]
+
+
+@pytest.mark.macos_only
+def test_folder_reference_symlink_alias_to_reserved_namespace_fails_closed(
+    tmp_path,
+):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    reserved = workspace / ".hermes" / "desktop-attachments"
+    reserved.mkdir(parents=True)
+    (reserved / "secret.pdf").write_bytes(b"secret")
+    (workspace / "attachment-alias").symlink_to(reserved, target_is_directory=True)
+
+    context = preprocess_context_references(
+        "Review @folder:attachment-alias",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert "secret.pdf" not in context.message
+    assert context.warnings
+    assert "attachment namespace cannot be listed" in context.warnings[0]
+
+
+def test_file_attach_registry_loss_after_restart_fails_closed(tmp_path):
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _session(cwd=str(workspace))
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c3RhbGUgc3RhZ2VkIGJ5dGVz",
+                },
+            }
+        )
+        restarted_session = _session(cwd=str(workspace))
+        context = preprocess_context_references(
+            f"Review {resp['result']['ref_text']}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                restarted_session, target
+            ),
+        )
+
+        assert "stale staged bytes" not in context.message
+        assert context.warnings
+        assert "not registered for this session" in context.warnings[0]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    ("name", "stored_name"),
+    [
+        ("report:3000", "report_3000"),
+        ("report:3000.", "report_3000"),
+        ("report:3000,", "report_3000"),
+    ],
+)
+def test_file_attach_range_shaped_name_remains_preprocessable(
+    monkeypatch, tmp_path, name, stored_name
+):
+    """Range-shaped filenames remain unambiguous after punctuation cleanup."""
+    from agent.context_references import preprocess_context_references
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": name,
+                    "data_url": "data:text/plain;base64,cmFuZ2Ugc2FmZSBjb250ZW50",
+                },
+            }
+        )
+        ref_text = resp["result"]["ref_text"]
+        context = preprocess_context_references(
+            f"Review {ref_text}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+            trusted_file_opener=lambda target: server._trusted_session_attachment_opener(
+                server._sessions["sid"], target
+            ),
+        )
+
+        assert ref_text == f"@file:.hermes/desktop-attachments/test-{stored_name}"
+        assert context.warnings == []
+        assert context.expanded is True
+        assert "range safe content" in context.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_uploaded_bytes_win_over_gateway_path_collision(monkeypatch, tmp_path):
+    """Client-uploaded bytes are authoritative even when its display path exists here."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    collision = tmp_path / "report.txt"
+    collision.write_text("gateway bytes", encoding="utf-8")
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: collision
+
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": str(collision),
+                    "name": "client-report.txt",
+                    "data_url": "data:text/plain;base64,Y2xpZW50IGJ5dGVz",
+                },
+            }
+        )
+
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-client-report.txt"
+        assert resp["result"]["path"] == (
+            ".hermes/desktop-attachments/test-client-report.txt"
+        )
+        assert resp["result"]["uploaded"] is True
+        assert stored.read_text(encoding="utf-8") == "client bytes"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     home = tmp_path / "home"
@@ -10448,19 +11253,282 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
             }
         )
 
-        stored = home / "attachments" / "outside.txt"
-        assert resp["result"]["attached"] is True
-        assert resp["result"]["uploaded"] is True
-        assert resp["result"]["ref_text"] == f"@file:{stored}"
-        assert stored.read_text(encoding="utf-8") == "outside workspace"
+        assert "error" in resp
+        assert "outside the session workspace" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
     finally:
         server._sessions.pop("sid", None)
 
 
-def test_file_attach_uses_in_workspace_file_without_copying(monkeypatch, tmp_path):
-    """Local case: file already inside the workspace → ref it directly, no copy."""
+def test_file_attach_rejects_sensitive_gateway_visible_file(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / ".env"
+    source.write_text("SECRET=not-for-context", encoding="utf-8")
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "sensitive credential" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_rejects_workspace_symlink_escape(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside workspace", encoding="utf-8")
+    link = workspace / "inside-name.txt"
+    link.symlink_to(outside)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: link
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(link)},
+            }
+        )
+
+        assert "error" in resp
+        assert "not a safe regular file" in resp["error"]["message"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_rejects_in_workspace_source_symlink(monkeypatch, tmp_path):
+    """Reject an alias even when its target remains inside the workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("regular bytes", encoding="utf-8")
+    alias = workspace / "report-alias.txt"
+    alias.symlink_to(source)
+    server._sessions["sid"] = _session(cwd=str(workspace))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(alias)},
+            }
+        )
+
+        assert "error" in resp
+        assert "not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.require_symlinks
+def test_file_attach_rejects_symlink_swap_after_workspace_resolution(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    source = workspace / "report.pdf"
+    source.write_bytes(b"safe workspace bytes")
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"outside bytes")
+    real_resolve = server._resolve_gateway_attachment_path
+
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
+        source.unlink()
+        source.symlink_to(outside)
+        return observed
+
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_regular_file_swap_after_resolution(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "report.txt"
+    source.write_text("safe source bytes", encoding="utf-8")
+    replacement = workspace / "replacement.txt"
+    replacement.write_text("replacement bytes", encoding="utf-8")
+    real_resolve = server._resolve_gateway_attachment_path
+
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
+        os.replace(replacement, source)
+        return observed
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_rejects_parent_swap_after_resolution(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    source_parent = workspace / "data"
+    source_parent.mkdir(parents=True)
+    source = source_parent / "report.txt"
+    source.write_text("safe source bytes", encoding="utf-8")
+    replacement_parent = workspace / "replacement"
+    replacement_parent.mkdir()
+    (replacement_parent / "report.txt").write_text(
+        "replacement bytes", encoding="utf-8"
+    )
+    real_resolve = server._resolve_gateway_attachment_path
+
+    def resolve_then_swap(raw, observed_workspace, workspace_alias):
+        observed = real_resolve(raw, observed_workspace, workspace_alias)
+        source_parent.rename(workspace / "data-original")
+        replacement_parent.rename(source_parent)
+        return observed
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setattr(server, "_resolve_gateway_attachment_path", resolve_then_swap)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.macos_only
+def test_file_attach_rejects_workspace_fifo_without_blocking(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fifo = workspace / "pending.csv"
+    os.mkfifo(fifo)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: fifo
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(fifo)},
+            }
+        )
+
+        assert "error" in resp
+        assert "not a safe regular file" in resp["error"]["message"]
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.macos_only
+def test_file_attach_response_keeps_trusted_name_after_staging_dir_swap(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    real_open = server._open_desktop_attachment_dir
+
+    @contextlib.contextmanager
+    def swap_after_close(session):
+        with real_open(session) as opened:
+            yield opened
+        hermes_dir = workspace / ".hermes"
+        hermes_dir.rename(workspace / ".hermes-written")
+
+    monkeypatch.setattr(server, "_open_desktop_attachment_dir", swap_after_close)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,c2FmZQ==",
+                },
+            }
+        )
+
+        assert "error" in resp
+        assert "changed or is not a safe regular file" in resp["error"]["message"]
+        assert ".hermes/desktop-attachments/test-report.txt" not in server._sessions[
+            "sid"
+        ].get("_trusted_file_attachments", {})
+        assert list(outside.iterdir()) == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_snapshots_in_workspace_file_with_no_follow(monkeypatch, tmp_path):
+    """Local path fallback is snapshotted before its workspace name can change."""
     workspace = tmp_path / "workspace"
     (workspace / "data").mkdir(parents=True)
+    home = tmp_path / "home"
     source = workspace / "data" / "exam.csv"
     source.write_text("a,b,c\n1,2,3\n", encoding="utf-8")
     fake_cli = types.ModuleType("cli")
@@ -10468,7 +11536,7 @@ def test_file_attach_uses_in_workspace_file_without_copying(monkeypatch, tmp_pat
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: source
 
-    server._sessions["sid"] = _session(cwd=str(workspace))
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     try:
@@ -10480,13 +11548,12 @@ def test_file_attach_uses_in_workspace_file_without_copying(monkeypatch, tmp_pat
             }
         )
 
+        stored = workspace / ".hermes" / "desktop-attachments" / "test-exam.csv"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
-        assert resp["result"]["ref_text"] == "@file:data/exam.csv"
-        # No copy: nothing staged under desktop-attachments or the home
-        # attachments dir.
-        assert not (workspace / ".hermes" / "desktop-attachments").exists()
-        assert not (tmp_path / "home" / "attachments").exists()
+        assert resp["result"]["path"] == ".hermes/desktop-attachments/test-exam.csv"
+        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/test-exam.csv"
+        assert stored.read_text(encoding="utf-8") == "a,b,c\n1,2,3\n"
     finally:
         server._sessions.pop("sid", None)
 
@@ -10508,7 +11575,10 @@ def test_file_attach_errors_when_unresolvable_and_no_bytes(monkeypatch, tmp_path
             {
                 "id": "1",
                 "method": "file.attach",
-                "params": {"session_id": "sid", "path": "/Users/alice/missing.txt"},
+                "params": {
+                    "session_id": "sid",
+                    "path": str(workspace / "missing.txt"),
+                },
             }
         )
 
@@ -10543,9 +11613,17 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
             }
         )
 
-        stored = tmp_path / "home" / "attachments" / "my exam schedule.csv"
+        stored = (
+            workspace
+            / ".hermes"
+            / "desktop-attachments"
+            / "test-my exam schedule.csv"
+        )
         assert resp["result"]["attached"] is True
-        assert resp["result"]["ref_text"] == f"@file:`{stored}`"
+        assert (
+            resp["result"]["ref_text"]
+            == "@file:`.hermes/desktop-attachments/test-my exam schedule.csv`"
+        )
         assert stored.read_text(encoding="utf-8") == "a,b\n"
     finally:
         server._sessions.pop("sid", None)
@@ -17278,6 +18356,8 @@ def test_image_attach_bytes_writes_to_gateway_dir(monkeypatch, tmp_path):
     written = Path(res["path"])
     assert written.is_file()
     assert written.parent == tmp_path / "images"
+    assert res["ref_path"] == f"images/{written.name}"
+    assert not Path(res["ref_path"]).is_absolute()
     assert written.read_bytes().startswith(b"\x89PNG")
     assert len(server._sessions["abx"]["attached_images"]) == 1
     assert res["bytes"] > 0

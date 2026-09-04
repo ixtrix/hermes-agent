@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { referenceRe, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
+import { parseReference, referenceRe, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
 
 import { UserMessageText } from './user-message-text'
 
@@ -21,6 +21,58 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(screen.queryByTitle('https://github.com/NousResearch/hermes-agent/pull/74790')).not.toBeNull()
     // The whole reference is one node — no bare `@url:` text left behind.
     expect(document.body.textContent).not.toContain('@url:')
+  })
+
+  it('keeps a numeric URL port instead of parsing it as a line range', () => {
+    expect(parseReference('@url:http://localhost:3000')).toEqual({
+      kind: 'url',
+      value: 'http://localhost:3000'
+    })
+  })
+
+  it('renders a numeric URL port as part of the link chip', () => {
+    render(<UserMessageText text="open @url:http://localhost:3000 now" />)
+
+    expect(screen.queryByTitle('http://localhost:3000')).not.toBeNull()
+  })
+
+  it('preserves a file line range in both parsing and the rendered chip target', () => {
+    expect(parseReference('@file:src/a.ts:12')).toEqual({
+      kind: 'file',
+      lineRange: '12',
+      value: 'src/a.ts'
+    })
+
+    render(<UserMessageText text="open @file:src/a.ts:12 now" />)
+
+    expect(screen.queryByTitle('src/a.ts:12')).not.toBeNull()
+  })
+
+  it('keeps a quoted range-shaped filename literal', () => {
+    expect(parseReference('@file:"reports/report:12"')).toEqual({
+      kind: 'file',
+      quoted: true,
+      value: 'reports/report:12'
+    })
+  })
+
+  it('preserves a quoted file range in the rendered chip target', () => {
+    render(<UserMessageText text="open @file:`src/my notes.ts`:12 now" />)
+
+    expect(screen.queryByTitle('src/my notes.ts:12')).not.toBeNull()
+  })
+
+  it('keeps a quoted file range when sentence punctuation follows it', () => {
+    expect(parseReference('@file:"/Users/alice/secret file.pdf":12,')).toEqual({
+      kind: 'file',
+      lineRange: '12',
+      quoted: true,
+      value: '/Users/alice/secret file.pdf'
+    })
+
+    render(<UserMessageText text='open @file:"/Users/alice/secret file.pdf":12, then summarize it' />)
+
+    expect(screen.queryByTitle('/Users/alice/secret file.pdf:12')).not.toBeNull()
   })
 
   it('chips a backtick-quoted @file: path with spaces', () => {

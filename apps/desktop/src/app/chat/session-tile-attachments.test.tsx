@@ -10,7 +10,7 @@ import {
   createComposerAttachmentOccurrenceId,
   createComposerAttachmentScope
 } from '@/store/composer'
-import { $connection, $sessions } from '@/store/session'
+import { $connection, $sessions, $terminalBackend } from '@/store/session'
 import { $sessionStates, type SessionTileDelegate, setSessionTileDelegate } from '@/store/session-states'
 
 import { deferred } from '../../test/deferred'
@@ -39,6 +39,7 @@ const RUNTIME_ID = 'runtime-tile'
 const STORED_ID = 'stored-tile'
 const HOST_PATH = 'C:\\Users\\alice\\Pictures\\photo.png'
 const STAGED_PATH = '/root/.hermes/attachments/photo.png'
+const STAGED_REF = 'images/photo.png'
 const THUMBNAIL = 'data:image/png;base64,dGh1bWJuYWls'
 const FULL_SOURCE = 'data:image/png;base64,b3JpZ2luYWw='
 
@@ -108,6 +109,7 @@ describe('session tile attachment occurrence ownership', () => {
     requestGateway.mockReset()
     $connection.set({ mode: 'local' } as never)
     $sessions.set([])
+    $terminalBackend.set('')
     $sessionStates.set({
       [RUNTIME_ID]: {
         ...createClientSessionState(STORED_ID),
@@ -123,6 +125,7 @@ describe('session tile attachment occurrence ownership', () => {
 
   afterEach(() => {
     Reflect.deleteProperty(window, 'hermesDesktop')
+    $terminalBackend.set('')
     $connection.set(null)
     $sessions.set([])
     $sessionStates.set({})
@@ -131,7 +134,7 @@ describe('session tile attachment occurrence ownership', () => {
   it('preserves a thumbnail that resolves before tile submit staging', async () => {
     const scope = createScope()
     const original = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -159,7 +162,7 @@ describe('session tile attachment occurrence ownership', () => {
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', expect.anything()))
     expect(scope.attachments.updateIfCurrent(original, { thumbnailUrl: THUMBNAIL })).toBe(true)
 
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(false)
@@ -168,7 +171,7 @@ describe('session tile attachment occurrence ownership', () => {
     expect(scope.attachments.$attachments.get()[0]).toMatchObject({
       attachedSessionId: RUNTIME_ID,
       occurrenceId: original.occurrenceId,
-      path: STAGED_PATH,
+      path: STAGED_REF,
       thumbnailUrl: THUMBNAIL
     })
   })
@@ -177,7 +180,7 @@ describe('session tile attachment occurrence ownership', () => {
     const scope = createScope()
     const original = makeAttachment()
     const replacement = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -206,7 +209,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.remove(original.id)
     scope.attachments.add(replacement)
 
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(false)
@@ -219,7 +222,7 @@ describe('session tile attachment occurrence ownership', () => {
     const scope = createScope()
     const original = makeAttachment()
     const replacement = makeAttachment()
-    const attach = deferred<{ attached: boolean; path: string }>()
+    const attach = deferred<{ attached: boolean; path: string; ref_path: string }>()
 
     requestGateway.mockImplementation(async (method: string) => {
       if (method === 'image.attach_bytes') {
@@ -243,7 +246,7 @@ describe('session tile attachment occurrence ownership', () => {
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('image.attach_bytes', expect.anything()))
     scope.attachments.remove(original.id)
     scope.attachments.add(replacement)
-    attach.resolve({ attached: true, path: STAGED_PATH })
+    attach.resolve({ attached: true, path: STAGED_PATH, ref_path: STAGED_REF })
 
     await act(async () => {
       await expect(submitted).resolves.toBe(true)
@@ -318,5 +321,125 @@ describe('session tile attachment occurrence ownership', () => {
     })
 
     expect(scope.attachments.$attachments.get()).toEqual([])
+  })
+
+  it.each([
+    "@file:'/Users/alice/report.pdf'",
+    '@file:"/Users/alice/report.pdf"',
+    '@file:`/Users/alice/report.pdf`:1-3',
+    '  @file:   "/Users/alice/report.pdf" :1-3  ',
+    '@file://server/share'
+  ])('rejects a remote pathless absolute file ref: %s', async refText => {
+    $connection.set({ mode: 'remote' } as never)
+    const scope = createScope()
+    scope.attachments.add({
+      id: `file:${refText}`,
+      kind: 'file',
+      label: 'report.pdf',
+      refText
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('read this')).resolves.toBe(false)
+    })
+
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { path: undefined, refText: '@folder:/Users/alice/project' },
+    { path: undefined, refText: '@folder:"\\Users\\alice\\project"' },
+    { path: '/Users/alice/project', refText: '@folder:project' },
+    { path: '\\Users\\alice\\project', refText: '@folder:project' }
+  ])('rejects a remote absolute folder ref: $path $refText', async ({ path, refText }) => {
+    $connection.set({ mode: 'remote' } as never)
+    const scope = createScope()
+    scope.attachments.add({
+      id: `folder:${path || refText}`,
+      kind: 'folder',
+      label: 'project',
+      path,
+      refText
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('inspect this folder')).resolves.toBe(false)
+    })
+
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, 'reports/quarterly'])(
+    'passes a remote workspace-relative folder ref through with path %s',
+    async path => {
+      $connection.set({ mode: 'remote' } as never)
+      const scope = createScope()
+      scope.attachments.add({
+        id: `folder:workspace-reports:${path || 'pathless'}`,
+        kind: 'folder',
+        label: 'reports',
+        path,
+        refText: '@folder:reports/quarterly'
+      })
+      const { result } = renderHook(() =>
+        useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      )
+
+      await act(async () => {
+        await expect(result.current.submitText('inspect this folder')).resolves.toBe(true)
+      })
+
+      expect(requestGateway).toHaveBeenCalledWith(
+        'prompt.submit',
+        {
+          session_id: RUNTIME_ID,
+          text: '@folder:reports/quarterly\n\ninspect this folder'
+        },
+        1_000
+      )
+    }
+  )
+
+  it.each(['docker', 'ssh'])('uploads POSIX host file bytes for a local %s tile backend', async terminalBackend => {
+    $terminalBackend.set(terminalBackend)
+    const scope = createScope()
+    scope.attachments.add({
+      id: 'file:/Users/alice/report.pdf',
+      kind: 'file',
+      label: 'report.pdf',
+      path: '/Users/alice/report.pdf',
+      refText: '@file:`/Users/alice/report.pdf`'
+    })
+    requestGateway.mockImplementation(async (method: string) => {
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          ref_text: '@file:.hermes/desktop-attachments/report.pdf',
+          uploaded: true
+        }
+      }
+
+      return {}
+    })
+    const { result } = renderHook(() =>
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+    )
+
+    await act(async () => {
+      await expect(result.current.submitText('read this')).resolves.toBe(true)
+    })
+
+    expect(window.hermesDesktop?.readFileDataUrl).toHaveBeenCalledWith('/Users/alice/report.pdf')
+    expect(requestGateway).toHaveBeenCalledWith('file.attach', {
+      data_url: FULL_SOURCE,
+      name: 'report.pdf',
+      session_id: RUNTIME_ID
+    })
   })
 })

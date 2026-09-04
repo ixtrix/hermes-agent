@@ -144,7 +144,56 @@ export const WIRE_REFERENCE_KINDS = ['file', 'folder', 'url', 'image', 'tool', '
  * a space — so the quoted forms are tried BEFORE bare `\S+`, or a quoted value
  * would end at the first space and strand the rest as prose.
  */
-const REFERENCE_PATTERN = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/
+const REFERENCE_PATTERN =
+  /@(file|folder|url|image|tool|line|terminal|session):[^\S\n]*(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+?)(?:[^\S\n]*:(\d+(?:-\d+)?))?(?=$|\s|(?<=["'`]|\d)[,.;!?)}\]])/
+
+const REFERENCE_TRAILING_PUNCTUATION_RE = /[,.;!?]+$/
+
+export interface ParsedReference {
+  kind: (typeof WIRE_REFERENCE_KINDS)[number]
+  quoted?: boolean
+  lineRange?: string
+  value: string
+}
+
+/** Parse one complete wire reference using the same grammar rendered by chips. */
+export function parseReference(text: string): ParsedReference | null {
+  const candidate = text.trim().replace(REFERENCE_TRAILING_PUNCTUATION_RE, '')
+  const match = new RegExp(`^(?:${REFERENCE_PATTERN.source})$`).exec(candidate)
+
+  if (!match) {
+    return null
+  }
+
+  const kind = match[1] as ParsedReference['kind']
+  let value = match[2] || ''
+  const quote = value[0]
+  const quoted = (quote === '`' || quote === '"' || quote === "'") && value.endsWith(quote)
+
+  if (quoted) {
+    value = value.slice(1, -1)
+  }
+
+  let lineRange: string | undefined = match[3]
+  if (lineRange && kind !== 'file') {
+    value = `${value}:${lineRange}`
+    lineRange = undefined
+  } else if (!lineRange && kind === 'file' && !quoted) {
+    const bareRange = value.match(/^(.*):(\d+(?:-\d+)?)$/)
+
+    if (bareRange) {
+      value = bareRange[1] || ''
+      lineRange = bareRange[2]
+    }
+  }
+
+  return {
+    kind,
+    ...(quoted ? { quoted: true } : {}),
+    ...(lineRange ? { lineRange } : {}),
+    value: quoted ? value : value.trim()
+  }
+}
 
 /**
  * A fresh matcher for every surface that has to find references in text: the

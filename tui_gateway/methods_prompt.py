@@ -1069,6 +1069,7 @@ def _(rid, params: dict) -> dict:
         {
             "attached": True,
             "path": str(img_path),
+            "ref_path": f"images/{img_path.name}",
             "count": len(session["attached_images"]),
             "remainder": "",
             "text": f"[User attached image: {img_path.name}]",
@@ -1232,21 +1233,20 @@ def _(rid, params: dict) -> dict:
     if not raw and not data_url:
         return _err(rid, 4015, "path or data_url required")
     try:
-        stored_path, uploaded = _stage_session_file_attachment(
+        with _stage_session_file_attachment(
             session, raw_path=raw, data_url=data_url, name=name
-        )
-        ref_path = _attachment_ref_path(session, stored_path)
-        return _ok(
-            rid,
-            {
-                "attached": True,
-                "name": stored_path.name,
-                "path": str(stored_path),
-                "ref_path": ref_path,
-                "ref_text": f"@file:{_format_ref_value(ref_path)}",
-                "uploaded": uploaded,
-            },
-        )
+        ) as staged:
+            return _ok(
+                rid,
+                {
+                    "attached": True,
+                    "name": staged.path.name,
+                    "path": staged.ref_path,
+                    "ref_path": staged.ref_path,
+                    "ref_text": f"@file:{_format_ref_value(staged.ref_path)}",
+                    "uploaded": staged.uploaded,
+                },
+            )
     except Exception as e:
         return _err(rid, 5028, str(e))
 
