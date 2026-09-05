@@ -194,6 +194,8 @@ export interface PluginProfileRoute {
   mode: 'local' | 'remote'
   /** Desktop profile used to select the connection route. */
   profile: string
+  /** Opaque registry route identity. Required by PluginContext.restFor. */
+  revision?: string
   /** Backend Hermes profile served by that route. */
   targetProfile: string
 }
@@ -279,7 +281,8 @@ async function pluginRouteStillRegistered(route: PluginProfileRoute): Promise<bo
       candidate =>
         candidate.connectionId === route.connectionId &&
         candidate.profile === route.profile &&
-        candidate.targetProfile === route.targetProfile
+        candidate.targetProfile === route.targetProfile &&
+        (!route.revision || candidate.revision === route.revision)
     )
   } catch {
     return false
@@ -1187,7 +1190,8 @@ export const host = {
   status: async () => getStatus(),
 
   /** Credential-free routes across every current registry source. Identity is
-   *  the (connectionId, profile) pair; endpoint/auth details stay in Electron. */
+   *  the (connectionId, profile, revision) tuple; endpoint/auth details stay
+   *  in Electron. */
   profileRoutes: async () => {
     const desktop = window.hermesDesktop
     const getProfileRoutes = desktop?.getProfileRoutes

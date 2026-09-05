@@ -1,6 +1,7 @@
 import type { HermesConnection } from '@/global'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import type { PluginProfileRoute } from '@/sdk'
 
 import { getApiRequestConnection, getApiRequestProfile, hermesApi, profileScoped } from './client'
 
@@ -82,6 +83,86 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
     ...profileScoped()
+  })
+}
+
+/** Pin REST to a current registry owner without inheriting foreground routing. */
+export async function pluginRestFor<T>(
+  pluginId: string,
+  route: PluginProfileRoute,
+  path: string,
+  opts: PluginRestOptions = {}
+): Promise<T> {
+  const desktop = window.hermesDesktop
+
+  if (!desktop?.api || !desktop.getProfileRoutes) {
+    throw new Error('Hermes Desktop fixed-route transport unavailable')
+  }
+
+  if (
+    !route ||
+    !route.connectionId?.trim() ||
+    !route.profile?.trim() ||
+    !route.revision?.trim() ||
+    !route.targetProfile?.trim()
+  ) {
+    throw new Error('Complete profile route with revision required')
+  }
+
+  const suffix = pluginPathSuffix('pluginRestFor', path)
+
+  // Raw C0/DEL characters can be stripped by WHATWG URL parsing and change a
+  // query key after this guard.
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(suffix)) {
+    throw new Error('pluginRestFor: ambiguous plugin path')
+  }
+
+  // Main/fetch parses this again. Do not admit encoded separators or dot
+  // segments that a later parser could normalize outside the namespace.
+  let pathname = suffix.split(/[?#]/, 1)[0]
+
+  for (let depth = 0; depth < 3 && pathname.includes('%'); depth++) {
+    pathname = decodeURIComponent(pathname)
+  }
+
+  // Deliberately reject decoded C0/space/DEL plus separator ambiguity.
+  // eslint-disable-next-line no-control-regex
+  const ambiguousPath = /[\u0000-\u0020\u007f%\\]/.test(pathname)
+
+  if (ambiguousPath || pathname.split('/').some(segment => segment === '.' || segment === '..')) {
+    throw new Error('pluginRestFor: ambiguous plugin path')
+  }
+
+  if (new URLSearchParams(suffix.split('?')[1]?.split('#')[0]).has('profile')) {
+    throw new Error('pluginRestFor: profile is owned by the route')
+  }
+
+  const captured = { ...route }
+  const routes = await desktop.getProfileRoutes([captured.profile])
+
+  if (
+    !routes.some(
+      candidate =>
+        candidate.connectionId === captured.connectionId &&
+        candidate.profile === captured.profile &&
+        candidate.targetProfile === captured.targetProfile &&
+        candidate.mode === captured.mode &&
+        candidate.revision === captured.revision
+    )
+  ) {
+    throw new Error('Profile route is no longer registered')
+  }
+
+  return desktop.api<T>({
+    path: `/api/plugins/${pluginId}${suffix}`,
+    method: opts.method,
+    body: opts.body,
+    upload: opts.upload,
+    timeoutMs: opts.timeoutMs,
+    connectionId: captured.connectionId,
+    profile: captured.profile,
+    expectedConnectionRevision: captured.revision
   })
 }
 

@@ -24,6 +24,39 @@ describe('createPluginContext.onDispose', () => {
   })
 })
 
+describe('createPluginContext.restFor', () => {
+  it('attributes a fixed-owner call to the calling plugin namespace', async () => {
+    const route = {
+      connectionId: 'internal',
+      mode: 'remote',
+      profile: 'default',
+      revision: 'revision-a',
+      targetProfile: 'internal'
+    } as const
+
+    const api = vi.fn().mockResolvedValue({ ok: true })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api, getProfileRoutes: vi.fn().mockResolvedValue([route]) }
+    })
+
+    try {
+      const ctx = createPluginContext('scope-mail')
+      await ctx.restFor(route, '/v2/capabilities')
+      expect(api).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          path: '/api/plugins/scope-mail/v2/capabilities',
+          connectionId: 'internal',
+          profile: 'default',
+          expectedConnectionRevision: 'revision-a'
+        })
+      )
+    } finally {
+      Reflect.deleteProperty(window, 'hermesDesktop')
+    }
+  })
+})
+
 describe('createPluginContext.os', () => {
   it('dispatches a native notification attributed to the plugin', () => {
     const ctx = createPluginContext('demo')

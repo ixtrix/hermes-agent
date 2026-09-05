@@ -10,6 +10,8 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 
+const revisionKey = Buffer.from('fixed-test-route-revision-key')
+
 function config(overrides: Partial<ProfileRouteConfig> = {}): ProfileRouteConfig {
   return {
     cloudOrg: '',
@@ -209,6 +211,7 @@ describe('buildRegistryProfileRoutes', () => {
         { connectionId: 'homelab', profile: 'research' }
       ],
       legacyRoutes: [{ connectionId: 'legacy-hash', mode: 'local', profile: 'research', targetProfile: 'research' }],
+      revisionKey,
       sources: [
         { id: 'local', kind: 'local', label: 'This device' },
         {
@@ -225,8 +228,20 @@ describe('buildRegistryProfileRoutes', () => {
     })
 
     expect(routes).toEqual([
-      { connectionId: 'local', mode: 'local', profile: 'research', targetProfile: 'research' },
-      { connectionId: 'homelab', mode: 'remote', profile: 'research', targetProfile: 'remote-research' }
+      {
+        connectionId: 'local',
+        mode: 'local',
+        profile: 'research',
+        revision: expect.any(String),
+        targetProfile: 'research'
+      },
+      {
+        connectionId: 'homelab',
+        mode: 'remote',
+        profile: 'research',
+        revision: expect.any(String),
+        targetProfile: 'remote-research'
+      }
     ])
     expect(JSON.stringify(routes)).not.toContain('private.lan')
     expect(JSON.stringify(routes)).not.toContain('id_ed25519')
@@ -238,10 +253,41 @@ describe('buildRegistryProfileRoutes', () => {
     const routes = buildRegistryProfileRoutes({
       agents: [{ connectionId: 'local', profile: 'barry' }],
       legacyRoutes: [{ connectionId: 'legacy-hash', mode: 'remote', profile: 'barry', targetProfile: 'default' }],
+      revisionKey,
       sources: [{ id: 'local', kind: 'local', label: 'This device' }]
     })
 
-    expect(routes).toEqual([{ connectionId: 'local', mode: 'local', profile: 'barry', targetProfile: 'barry' }])
+    expect(routes).toEqual([
+      {
+        connectionId: 'local',
+        mode: 'local',
+        profile: 'barry',
+        revision: expect.any(String),
+        targetProfile: 'barry'
+      }
+    ])
+  })
+
+  it('changes revision on an endpoint or auth rebind under the same id but ignores labels', () => {
+    const build = (source: Parameters<typeof buildRegistryProfileRoutes>[0]['sources'][number]) =>
+      buildRegistryProfileRoutes({
+        agents: [{ connectionId: source.id, profile: 'default' }],
+        revisionKey,
+        sources: [source]
+      })[0].revision
+
+    const original = {
+      authMode: 'token' as const,
+      id: 'office',
+      kind: 'remote' as const,
+      label: 'Office',
+      token: { encrypted: 'secret-a' },
+      url: 'https://old.example'
+    }
+
+    expect(build({ ...original, label: 'Renamed office' })).toBe(build(original))
+    expect(build({ ...original, url: 'https://new.example' })).not.toBe(build(original))
+    expect(build({ ...original, token: { encrypted: 'secret-b' } })).not.toBe(build(original))
   })
 
   it('scopes registry-shared remote websocket URLs to the requested profile', () => {

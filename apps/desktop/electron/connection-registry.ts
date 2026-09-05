@@ -237,6 +237,7 @@ export interface ResolvedConnectionDescriptor {
    * Invalid or retired claims fail closed; only descriptors with no such
    * property may enter the legacy compatibility resolver. */
   connectionId?: unknown
+  connectionRevision?: string
   headers?: Record<string, unknown>
   mode?: 'local' | 'remote'
   org?: unknown

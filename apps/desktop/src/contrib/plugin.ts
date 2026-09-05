@@ -12,9 +12,10 @@
  * through the plugin host loader (next phase); this is that seam.
  */
 
-import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
+import { pluginRest, pluginRestFor, type PluginRestOptions, pluginSocket } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
+import type { PluginProfileRoute } from '@/sdk'
 import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
 
 import { registry } from './registry'
@@ -75,6 +76,8 @@ export interface PluginContext {
    *  `plugin_api.py` — profile-aware, namespace-scoped by construction. Use
    *  `host.request` for gateway JSON-RPC. */
   rest: <T>(path: string, opts?: PluginRestOptions) => Promise<T>
+  /** REST pinned to a current registry owner, independent of foreground routing. */
+  restFor: <T>(route: PluginProfileRoute, path: string, opts?: PluginRestOptions) => Promise<T>
   /** Live twin of `rest`: a WebSocket to this plugin's own namespace
    *  ('/events'), JSON frames to `onMessage`, auto-reconnect, disposer
    *  returned. Resolves to a no-op on OAuth remotes — treat it as an
@@ -177,6 +180,8 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     registerMany: cs => track(registry.registerMany(cs.map(scope))),
     onDispose: fn => void track(fn),
     rest: <T>(path: string, opts?: PluginRestOptions) => pluginRest<T>(pluginId, path, opts),
+    restFor: <T>(route: PluginProfileRoute, path: string, opts?: PluginRestOptions) =>
+      pluginRestFor<T>(pluginId, route, path, opts),
     socket: (path, onMessage) => track(pluginSocket(pluginId, path, onMessage)),
     os: createPluginOs(pluginId),
     storage: createPluginStorage(pluginId),

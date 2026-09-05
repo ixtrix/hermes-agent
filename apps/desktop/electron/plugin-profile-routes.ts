@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 
+import { connectionRouteRevision } from './connection-route-identity'
+
 export interface ProfileRouteConfig {
   cloudOrg: string
   mode: 'cloud' | 'local' | 'remote' | 'ssh'
@@ -21,6 +23,7 @@ export interface OpaqueProfileRoute {
   connectionId: string
   mode: 'local' | 'remote'
   profile: string
+  revision?: string
   targetProfile: string
 }
 
@@ -39,6 +42,7 @@ interface RegistryProfileRouteSource {
 interface BuildRegistryProfileRoutesOptions {
   agents: RegistryProfileRouteAgent[]
   legacyRoutes?: OpaqueProfileRoute[]
+  revisionKey: crypto.BinaryLike
   sources: RegistryProfileRouteSource[]
 }
 
@@ -257,6 +261,7 @@ export async function buildOpaqueProfileRoutes({
  */
 export function buildRegistryProfileRoutes({
   agents,
+  revisionKey,
   sources
 }: BuildRegistryProfileRoutesOptions): OpaqueProfileRoute[] {
   const sourceById = new Map(sources.map(source => [source.id, source]))
@@ -267,8 +272,9 @@ export function buildRegistryProfileRoutes({
     const profile = normalizeProfile(agent.profile)
     const source = sourceById.get(agent.connectionId)
     const key = `${agent.connectionId}\0${profile}`
+    const revision = source ? connectionRouteRevision(source, revisionKey) : null
 
-    if (!source || seen.has(key)) {
+    if (!source || !revision || seen.has(key)) {
       continue
     }
 
@@ -279,6 +285,7 @@ export function buildRegistryProfileRoutes({
         connectionId: source.id,
         mode: 'local',
         profile,
+        revision,
         targetProfile: profile
       })
 
@@ -289,6 +296,7 @@ export function buildRegistryProfileRoutes({
       connectionId: source.id,
       mode: 'remote',
       profile,
+      revision,
       targetProfile: source.kind === 'ssh' && source.remoteProfile ? normalizeProfile(source.remoteProfile) : profile
     })
   }

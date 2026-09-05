@@ -694,6 +694,9 @@ export interface DesktopPluginProfileRoute {
   connectionId: string
   mode: 'local' | 'remote'
   profile: string
+  // Opaque main-process route identity. Present on registry routes; optional
+  // for compatibility with older Desktop mains and legacy route producers.
+  revision?: string
   targetProfile: string
 }
 
@@ -1186,6 +1189,9 @@ export interface HermesApiRequest {
   // through the owning connection, not the local profile pool. Omit / '' to
   // keep the legacy profile-routed path; explicit 'local' forces this device.
   connectionId?: string | null
+  // Fail closed if the named registry source no longer has this exact opaque
+  // endpoint/auth revision. Existing callers may omit it.
+  expectedConnectionRevision?: string | null
 }
 
 export interface HermesNotification {

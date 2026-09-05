@@ -6,6 +6,8 @@
  * but must never reconstruct a stronger identity from post-dial metadata.
  */
 
+import crypto from 'node:crypto'
+
 import { normalizeRemoteBaseUrl, normalizeRemoteHeaders, normalizeSshConfig, normAuthMode } from './connection-config'
 import type { ConnectionRegistry, RegistryConnection } from './connection-registry'
 
@@ -29,6 +31,22 @@ export type StoredRoute =
       url?: unknown
     }
   | ({ kind: 'ssh' } & Partial<SshRouteConfig>)
+
+export interface ConnectionRouteRevisionSource {
+  authMode?: unknown
+  headers?: Record<string, unknown>
+  host?: string
+  id: string
+  keyPath?: string
+  kind: 'cloud' | 'local' | 'remote' | 'ssh'
+  org?: unknown
+  port?: number
+  remoteHermesPath?: string
+  remoteProfile?: string
+  token?: unknown
+  url?: unknown
+  user?: string
+}
 
 function stableValue(value: unknown): string {
   if (!value || typeof value !== 'object') {
@@ -68,7 +86,7 @@ function routeIdentity(route: StoredRoute): null | string {
       port: ssh.port || 22,
       remoteHermesPath: ssh.remoteHermesPath || '',
       remoteProfile: ssh.remoteProfile || '',
-      user: (ssh.user || '').trim().toLowerCase()
+      user: (ssh.user || '').trim()
     })
   }
 
@@ -86,6 +104,36 @@ function routeIdentity(route: StoredRoute): null | string {
   } catch {
     return null
   }
+}
+
+/** Main-process-only revision for one registry source's complete dial route. */
+export function connectionRouteRevision(
+  connection: ConnectionRouteRevisionSource,
+  secret: crypto.BinaryLike
+): null | string {
+  const identity =
+    connection.kind === 'local' ? stableValue({ kind: 'local' }) : routeIdentity(connection as StoredRoute)
+
+  if (!identity) {
+    return null
+  }
+
+  return crypto
+    .createHmac('sha256', secret)
+    .update(stableValue({ id: connection.id, route: identity }))
+    .digest('base64url')
+}
+
+/** Exact revision invariant used after a dial/cache claim resolves. */
+export function connectionRouteRevisionMatches(
+  expectedRevision: null | string | undefined,
+  resolvedRevision: unknown,
+  source: ConnectionRouteRevisionSource,
+  secret: crypto.BinaryLike
+): boolean {
+  const expected = String(expectedRevision || '').trim()
+
+  return !expected || (resolvedRevision === expected && connectionRouteRevision(source, secret) === expected)
 }
 
 function registryRoute(connection: RegistryConnection): null | StoredRoute {

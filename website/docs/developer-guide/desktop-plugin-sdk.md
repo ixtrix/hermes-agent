@@ -171,6 +171,8 @@ interface PluginContext {
   registerMany: (cs: PluginContribution[]) => () => void
   /** REST to this plugin's own backend namespace (`/api/plugins/<id>`). */
   rest: <T>(path: string, opts?: PluginRestOptions) => Promise<T>
+  /** REST pinned to an exact current route from host.profileRoutes(). */
+  restFor: <T>(route: PluginProfileRoute, path: string, opts?: PluginRestOptions) => Promise<T>
   /** Live WebSocket to this plugin's own namespace. Returns a disposer. */
   socket: (path: string, onMessage: (data: unknown) => void) => () => void
   /** The curated OS door: native notification, open-external, reveal-in-file-manager, clipboard. */
@@ -804,6 +806,29 @@ register(ctx) {
 `ctx.rest` is profile-aware and rejects path traversal (`..`) so you can never
 address another plugin's API or a core route through it. `PluginRestOptions` is
 `{ method?, body?, upload?: { filename, contentType?, bytes }, timeoutMs? }`.
+
+For a long-lived view that must keep its owner while the foreground gateway
+changes, use `ctx.restFor(route, path, options)`. Obtain `route` from
+`host.profileRoutes()`; do not construct it from a profile label. This method
+revalidates the complete current registry descriptor and passes its explicit
+connection and source-local profile through Electron's existing registry
+transport. Its opaque revision binds the registry source id to the complete
+endpoint and auth configuration held by Electron. An explicit `local`
+connection stays local even when a remote is primary. Missing, replaced, or
+reconfigured routes fail; fetch never follows a rebound connection id.
+
+```ts
+if (typeof ctx.restFor !== 'function') throw new Error('Fixed-route Desktop required')
+const capabilities = await ctx.restFor(route, '/v2/capabilities')
+```
+
+This is a transport pin, not employee authorization. The backend must authenticate
+the caller and validate any owner-binding assertion before business access. The
+same namespace and method/body/upload/timeout contract applies. Traversal,
+ambiguous encoded paths and a caller-supplied `profile` query are rejected.
+An upload still requires support from the underlying Electron/auth transport;
+the new method does not add OAuth multipart support. The host's profile routes
+remain credential-free. Mailbox content does not belong in plugin storage.
 
 `ctx.socket` auto-reconnects with backoff until disposed. **It resolves to a no-op
 on OAuth remotes** (single-use WS tickets are core-managed) — treat the socket as

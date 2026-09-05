@@ -129,6 +129,7 @@ import {
   backendScopePrefix,
   buildAgentRoster,
   connectionDialFieldsChanged,
+  LOCAL_CONNECTION_ID,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -151,6 +152,7 @@ import {
   upsertConnection
 } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import { connectionRouteRevision, connectionRouteRevisionMatches } from './connection-route-identity'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -1385,6 +1387,38 @@ const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
 // lifecycles, so concurrent dials for one (connectionId, profile) scope
 // coalesce here — the second caller awaits the first spawn's result.
 const backendDialClaims = new BackendDialClaims()
+// Per-process HMAC key: renderers receive only revisions, never credential
+// identity material or a reusable key that could mint a revision.
+const registryRouteRevisionKey = crypto.randomBytes(32)
+
+function registryConnectionRevision(source) {
+  const revision = connectionRouteRevision(source, registryRouteRevisionKey)
+
+  if (!revision) {
+    throw new Error(`Connection "${source?.id || ''}" has no valid route identity.`)
+  }
+
+  return revision
+}
+
+function assertCurrentRegistryConnectionRevision(connectionId, expectedRevision, descriptor) {
+  const expected = String(expectedRevision || '').trim()
+
+  if (!expected) {
+    return
+  }
+
+  const registry = readDesktopConnectionsRegistry()
+  const source = registry.connections.find(connection => connection.id === connectionId)
+
+  if (
+    !source ||
+    !connectionRouteRevisionMatches(expected, descriptor?.connectionRevision, source, registryRouteRevisionKey)
+  ) {
+    throw new Error('Profile route is no longer registered.')
+  }
+}
+
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -5022,6 +5056,8 @@ function fetchJson(url, token, options: any = {}) {
           return
         }
 
+        options.beforeFetch?.()
+
         const req = client.request(
           parsed,
           {
@@ -7373,12 +7409,16 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     const body = serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
+    options.beforeFetch?.()
+
     const request = electronNet.request({
       method: options.method || 'GET',
       url,
       session: sess,
       useSessionCookies: true,
-      redirect: 'follow'
+      // A guarded request cannot safely auto-follow: Electron would issue the
+      // redirected HTTP attempt without another revision check.
+      redirect: options.beforeFetch ? 'error' : 'follow'
     } as any)
 
     setJsonRequestHeaders(request)
@@ -7550,7 +7590,10 @@ function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
 // Return a valid native access token for baseUrl, refreshing via
 // /auth/native/refresh if the stored one is at/near expiry. Returns null when
 // there are no tokens or the refresh is terminally rejected (caller re-logins).
-async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
+async function ensureNativeAccessToken(
+  baseUrl: string,
+  options: { beforeFetch?: () => void } = {}
+): Promise<string | null> {
   const tokens = _loadNativeTokens(baseUrl)
 
   if (!tokens) {
@@ -7572,7 +7615,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
     const body = await postJsonNoAuth(
       nativeRefreshUrl(baseUrl),
       { refresh_token: tokens.refreshToken, provider: tokens.provider },
-      { timeoutMs: 10_000 }
+      { timeoutMs: 10_000, beforeFetch: options.beforeFetch }
     )
 
     const rotated = parseTokenResponse(body)
@@ -11063,13 +11106,27 @@ async function ensureBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
+async function ensureRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  expectedConnectionRevision = ''
+) {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const source = registry.connections.find(c => c.id === id)
 
   if (!source) {
     throw new Error(`No connection with id "${id}".`)
+  }
+
+  // Capture the full route identity before the first await. A stable registry
+  // id is not authority to follow an endpoint/auth rebind.
+  const sourceRevision = registryConnectionRevision(source)
+  const expectedRevision = String(expectedConnectionRevision || '').trim()
+
+  if (expectedRevision && sourceRevision !== expectedRevision) {
+    throw new Error('Profile route is no longer registered.')
   }
 
   if (source.kind === 'ssh') {
@@ -11117,20 +11174,23 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   // when both identities match; otherwise a default-profile registry request
   // opens a second SSH dashboard under a different scope and the competing
   // lifecycle probes repeatedly tear down each other's tunnel.
-  const primary = await reuseMatchingPrimarySshBackend({
-    connectionId: id,
-    effectiveFingerprint: resolveRegistryEffectiveFingerprint,
-    ensurePrimary: () => ensureBackend(profile),
-    profile,
-    registry,
-    source
-  })
+  const primary = expectedRevision
+    ? null
+    : await reuseMatchingPrimarySshBackend({
+        connectionId: id,
+        effectiveFingerprint: resolveRegistryEffectiveFingerprint,
+        ensurePrimary: () => ensureBackend(profile),
+        profile,
+        registry,
+        source
+      })
 
   if (primary) {
     return {
       ...primary,
       profile: profileKey,
-      connectionId: id
+      connectionId: id,
+      connectionRevision: sourceRevision
     }
   }
 
@@ -11140,14 +11200,15 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   // resolves its live descriptor back to this exact source id; otherwise one
   // Desktop window starts two isolated servers whose transient runtime ids
   // are not interchangeable.
-  if (id === registry.primary && source.kind !== 'local' && source.kind !== 'ssh') {
+  if (!expectedRevision && id === registry.primary && source.kind !== 'local' && source.kind !== 'ssh') {
     const primaryDescriptor = await ensureBackend(profile)
 
     if (registrySourceOwnsPrimaryBackend(registry, id, primaryDescriptor)) {
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id
+        connectionId: id,
+        connectionRevision: sourceRevision
       }
     }
   }
@@ -11164,13 +11225,22 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     // can't collide with the v1 remote descriptor cached at the bare key.
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolveRegistryLocalRoute(profileKey, {
+    const resolvedLocalRoute = resolveRegistryLocalRoute(profileKey, {
       globalRemote: globalRemoteActive(),
       profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
     })
 
+    // A legacy local descriptor has no full registry route proof. Fixed-route
+    // calls use the forced-local composite pool even when v1 could delegate.
+    const localRoute =
+      expectedRevision && resolvedLocalRoute.delegate
+        ? { delegate: false, poolKey: `${backendScopePrefix(id)}${profileKey}` }
+        : resolvedLocalRoute
+
     if (localRoute.delegate) {
-      return ensureBackend(profile)
+      const connection = await ensureBackend(profile)
+
+      return { ...connection, connectionId: id, connectionRevision: sourceRevision }
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -11201,21 +11271,27 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     localEntry.connectionPromise = spawnPoolBackend(profileKey, localEntry, {
       forceLocal: true,
       poolKey: localRoute.poolKey
-    }).catch(async error => {
-      // Same trace rule as the v1 pool path: a forced-local child whose spawn
-      // rejects before the child exists must still land in desktop.log.
-      rememberLog(
-        `Hermes backend for profile "${profileKey}" (forced-local) failed to start: ${error instanceof Error ? error.message : String(error)}`
-      )
-
-      if (backendPool.get(localRoute.poolKey) === localEntry) {
-        backendPool.delete(localRoute.poolKey)
-      }
-
-      stopBackendChild(localEntry.process)
-      await waitForBackendExit(localEntry.process)
-      throw error
     })
+      .then(connection => ({
+        ...connection,
+        connectionId: id,
+        connectionRevision: sourceRevision
+      }))
+      .catch(async error => {
+        // Same trace rule as the v1 pool path: a forced-local child whose spawn
+        // rejects before the child exists must still land in desktop.log.
+        rememberLog(
+          `Hermes backend for profile "${profileKey}" (forced-local) failed to start: ${error instanceof Error ? error.message : String(error)}`
+        )
+
+        if (backendPool.get(localRoute.poolKey) === localEntry) {
+          backendPool.delete(localRoute.poolKey)
+        }
+
+        stopBackendChild(localEntry.process)
+        await waitForBackendExit(localEntry.process)
+        throw error
+      })
     backendPool.set(localRoute.poolKey, localEntry)
     startPoolIdleReaper()
 
@@ -11237,8 +11313,12 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       ensureHealthyPooledRemoteBackendForDispatch({
         connectionPromise,
         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
-        probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
-        reconnect: () => ensureRegistryBackend(id, profile),
+        probe: (connection, requestPath, options) =>
+          fetchJsonForBackend(connection, requestPath, {
+            ...options,
+            beforeFetch: () => assertCurrentRegistryConnectionRevision(id, expectedRevision, connection)
+          }),
+        reconnect: () => ensureRegistryBackend(id, profile, '', expectedRevision),
         retire: async (error: any) => {
           // A late failure from an old descriptor must never tear down a newer
           // entry that another caller has already installed.
@@ -11276,6 +11356,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     profile,
     key,
     entry,
+    sourceRevision,
     resolveRegistrySshConfig(),
     source.kind === 'ssh' ? resolveRegistryEffectiveFingerprint() : null,
     managedUpdateCorrelation
@@ -11300,6 +11381,7 @@ async function connectRegistryBackend(
   profile,
   key,
   poolEntry,
+  connectionRevision,
   resolvedSshConfig?,
   resolvedEffectiveFingerprint?: null | Promise<string>,
   managedUpdateCorrelation = '',
@@ -11338,6 +11420,7 @@ async function connectRegistryBackend(
       ...connection,
       profile: profileKey,
       connectionId: source.id,
+      connectionRevision,
       // The remote process runs as this profile; the desktop-side profile key
       // is only the routing label. hermes:api uses it to translate explicit
       // self-profile query filters into the backend's namespace.
@@ -11370,6 +11453,7 @@ async function connectRegistryBackend(
     ...connection,
     profile: profileKey,
     connectionId: source.id,
+    connectionRevision,
     // One host, many profiles: REST paths must carry ?profile= (same contract
     // as the global-remote shared-primary route).
     sharedRemote: true,
@@ -11410,6 +11494,7 @@ async function ensureManagedSshBackendAtKey(source, profile, key, correlationId,
     profile,
     key,
     entry,
+    registryConnectionRevision(source),
     managedSshConfig(source, profile),
     null,
     correlationId,
@@ -14630,7 +14715,7 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
     ]
   }
 
-  return buildRegistryProfileRoutes({ agents, sources: registry.connections })
+  return buildRegistryProfileRoutes({ agents, revisionKey: registryRouteRevisionKey, sources: registry.connections })
 })
 ipcMain.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
 ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
@@ -15259,7 +15344,7 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
 async function fetchJsonForBackend(
   descriptor,
   path,
-  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number } = {}
+  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; beforeFetch?: () => void } = {}
 ) {
   const url = `${descriptor.baseUrl}${path}`
 
@@ -15270,32 +15355,46 @@ async function fetchJsonForBackend(
       throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
     }
 
-    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl).catch(() => null)
+    // Native token refresh may itself perform network I/O.
+    opts.beforeFetch?.()
+
+    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl, { beforeFetch: opts.beforeFetch }).catch(
+      () => null
+    )
 
     if (nativeAt) {
+      opts.beforeFetch?.()
+
       return fetchJson(url, null, {
         method: opts.method,
         body: opts.body,
         timeoutMs: opts.timeoutMs,
         bearer: nativeAt,
-        headers: descriptor.headers
+        headers: descriptor.headers,
+        beforeFetch: opts.beforeFetch
       })
     }
+
+    opts.beforeFetch?.()
 
     return fetchJsonViaOauthSession(url, {
       method: opts.method,
       body: opts.body,
       timeoutMs: opts.timeoutMs,
-      headers: descriptor.headers
+      headers: descriptor.headers,
+      beforeFetch: opts.beforeFetch
     })
   }
+
+  opts.beforeFetch?.()
 
   return fetchJson(url, descriptor.token, {
     method: opts.method,
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
+    headers: descriptor.headers,
+    beforeFetch: opts.beforeFetch
   })
 }
 
@@ -15854,13 +15953,24 @@ async function dispatchRegistryApiRequest(
   routeProfile = request?.profile,
   requestProfile = request?.profile
 ) {
+  const expectedRevision = String(request?.expectedConnectionRevision || '').trim()
+
+  const claimKey =
+    expectedRevision && registryConnectionId === LOCAL_CONNECTION_ID
+      ? `${backendScopePrefix(registryConnectionId)}${String(routeProfile ?? '').trim() || 'default'}`
+      : backendScopeKey(registryConnectionId, routeProfile)
+
   // Claim-guarded (#90812): every registry-scoped REST call funnels through
   // here, so it can race a renderer's own WS reconnect dial for the same
   // (connectionId, profile) scope; coalescing avoids bootstrapping a second
   // SSH tunnel / remote dashboard.
-  const connection: any = await backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile), () =>
-    ensureRegistryBackend(registryConnectionId, routeProfile)
+  const connection: any = await backendDialClaims.run(claimKey, () =>
+    ensureRegistryBackend(registryConnectionId, routeProfile, '', expectedRevision)
   )
+
+  // This check must be outside BackendDialClaims.run(): a coalesced caller gets
+  // another caller's promise and its callback never executes.
+  assertCurrentRegistryConnectionRevision(registryConnectionId, expectedRevision, connection)
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
@@ -15868,8 +15978,14 @@ async function dispatchRegistryApiRequest(
     method: request?.method,
     body: request?.body,
     upload: request?.upload,
-    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS),
+    // OAuth auth resolution awaits before network I/O. Re-read at the final
+    // synchronous boundary so an edit during that await cannot retarget fetch.
+    beforeFetch: () => assertCurrentRegistryConnectionRevision(registryConnectionId, expectedRevision, connection)
   })
+
+  // A source edit while the request was in flight invalidates its response too.
+  assertCurrentRegistryConnectionRevision(registryConnectionId, expectedRevision, connection)
 
   return (request?.method || 'GET').toUpperCase() === 'GET'
     ? tagRegistrySessionResponse(requestPath, response, registryConnectionId)
